@@ -669,11 +669,18 @@ fn resolve_api_key(cli_key: Option<&str>, config_key: Option<&str>, provider: Pr
 /// Platform-aware app config root.
 ///
 /// - Linux:   `~/.config/aionrs`
-/// - macOS:   `~/Library/Application Support/aionrs`
+/// - macOS:   `~/.aionrs`
 /// - Windows: `%APPDATA%\aionrs`
+#[cfg(not(target_os = "macos"))]
 pub fn app_config_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("aionrs"))
 }
+
+#[cfg(target_os = "macos")]
+#[path = "config_dir.rs"]
+mod config_dir;
+#[cfg(target_os = "macos")]
+pub use config_dir::app_config_dir;
 
 // --- Config file loading and merging ---
 
