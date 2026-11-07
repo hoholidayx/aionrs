@@ -7,7 +7,7 @@ use aion_config::config::{Config, McpServerConfig};
 use aion_config::shell::{ResolvedShell, resolve_shell_config};
 use aion_mcp::manager::McpManager;
 use aion_mcp::tool_proxy::register_mcp_tools;
-use aion_memory::paths::{ENTRYPOINT_NAME, auto_memory_dir};
+use aion_memory::paths::ENTRYPOINT_NAME;
 use aion_providers::{LlmProvider, create_provider};
 use aion_skills::loader::load_all_skills;
 use aion_skills::permissions::SkillPermissionChecker;
@@ -216,7 +216,7 @@ impl AgentBootstrap {
     fn resolve_environment(&self, workspace_path: PathBuf) -> Result<BootstrapEnvironment> {
         Ok(BootstrapEnvironment {
             resolved_shell: resolve_shell_config(&self.config.shell)?,
-            memory_dir: auto_memory_dir(&workspace_path),
+            memory_dir: None,
             workspace: workspace_path,
         })
     }

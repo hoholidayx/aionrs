@@ -15,7 +15,6 @@ A Rust-based LLM tool-use agent for the command line. It connects to LLM APIs, a
 - **Hook system** — Event-driven automation on tool lifecycle (auto-format, lint, audit)
 - **Sub-agent spawning** — Parallel task execution via the Spawn tool
 - **Session persistence** — Save and resume conversation history
-- **Persistent memory** — Project-specific memory with auto-indexing across sessions (see [docs/advanced.md](docs/advanced.md#memory-system))
 - **Plan mode** — Read-only exploration mode for designing implementation plans before coding (see [docs/advanced.md](docs/advanced.md#plan-mode))
 - **Context compression** — Stable tool-output limits, token-based autocompact, and an emergency guard (see [docs/advanced.md](docs/advanced.md#context-compression))
 - **Output compaction** — Configurable output compression (off/safe/full) with TOON encoding (see [docs/advanced.md](docs/advanced.md#output-compaction))

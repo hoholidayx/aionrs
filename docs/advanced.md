@@ -272,7 +272,7 @@ Running aion in `packages/server/` produces a system prompt containing both file
 
 ## Memory System
 
-Persistent, file-based memory that allows the agent to retain project-specific knowledge across sessions. Memory is automatically loaded into the system prompt at conversation start.
+The standard agent bootstrap skips built-in Markdown memory. Use the layout below to locate or migrate existing memory files.
 
 ### Memory Types
 
@@ -285,11 +285,11 @@ Persistent, file-based memory that allows the agent to retain project-specific k
 
 ### Storage
 
-Memory files live in a per-project directory under the global config:
+Existing memory files use a per-project directory under the aionrs config directory (or the base previously set via `AIONRS_MEMORY_DIR`):
 
 ```
-<config_dir>/aionrs/projects/<sanitized-project-path>/memory/
-├── MEMORY.md              # Index (auto-loaded into prompt, max 200 lines)
+<memory-base>/projects/<sanitized-project-path>/memory/
+├── MEMORY.md              # Index of topic files
 ├── user_role.md
 ├── feedback_testing.md
 └── project_auth_rewrite.md
@@ -306,23 +306,6 @@ type: project
 
 Auth middleware rewrite is driven by legal/compliance requirements.
 ```
-
-### Configuration
-
-Memory is enabled by default with no configuration required. The memory directory is auto-resolved from the current working directory.
-
-Override the base directory via environment variable:
-
-```bash
-export AIONRS_MEMORY_DIR=/custom/path
-```
-
-### How It Works
-
-1. Agent starts → memory directory resolved from project path
-2. `MEMORY.md` index loaded into system prompt (truncated at 200 lines / 25 KB)
-3. Agent reads/writes memory files using standard Read/Write tools
-4. Agent maintains the `MEMORY.md` index as memories are added or removed
 
 ---
 

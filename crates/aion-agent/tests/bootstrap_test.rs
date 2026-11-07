@@ -154,8 +154,10 @@ async fn custom_prompt_stays_first_in_normal_and_plan_requests() {
             "You are powered by the model",
             "Current date:",
             "# Using your tools",
+            "# auto memory",
+            "## MEMORY.md",
         ] {
-            assert!(!request.system.contains(absent));
+            assert!(!request.system.contains(absent), "unexpected {absent}");
         }
         assert!(request.tools.iter().any(|tool| tool.name == "Read"));
     }
