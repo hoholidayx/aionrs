@@ -79,8 +79,9 @@ pub struct AgentEngine {
     compat: ProviderCompat,
     /// Provider wire format fixed at construction.
     chat_completions: bool,
-    /// Model settings installed by the host between user runs.
-    tool_round_reasoning_models: HashSet<String>,
+    /// Default and per-model exceptions installed by the host between user runs.
+    tool_round_reasoning_default: bool,
+    tool_round_reasoning_exceptions: HashSet<String>,
     /// Optional provider-neutral thinking configuration for model requests.
     thinking: Option<ThinkingConfig>,
     /// Base system prompt sent with each model request.
@@ -220,7 +221,8 @@ impl AgentEngine {
             compat: config.compat.clone(),
             chat_completions: config.provider == ProviderType::OpenAI
                 && config.compat.openai_api_mode() == OpenAiApiMode::ChatCompletions,
-            tool_round_reasoning_models: HashSet::new(),
+            tool_round_reasoning_default: false,
+            tool_round_reasoning_exceptions: HashSet::new(),
             system_prompt,
             reasoning_effort: None,
             messages: Vec::new(),
@@ -322,7 +324,8 @@ impl AgentEngine {
             compat: config.compat.clone(),
             chat_completions: config.provider == ProviderType::OpenAI
                 && config.compat.openai_api_mode() == OpenAiApiMode::ChatCompletions,
-            tool_round_reasoning_models: HashSet::new(),
+            tool_round_reasoning_default: false,
+            tool_round_reasoning_exceptions: HashSet::new(),
             system_prompt,
             reasoning_effort: None,
             messages: session.messages.clone(),
@@ -385,10 +388,16 @@ impl AgentEngine {
         self.chat_completions
     }
 
-    /// Install a provider's model settings snapshot between user runs.
+    /// Opt the listed models into tool-round reasoning between user runs.
     pub fn set_tool_round_reasoning_models(&mut self, models: HashSet<String>) {
+        self.set_tool_round_reasoning_policy(false, models);
+    }
+
+    /// Install a provider's default and the models that use the opposite policy.
+    pub fn set_tool_round_reasoning_policy(&mut self, default_enabled: bool, model_exceptions: HashSet<String>) {
         let previously_enabled = self.tool_round_reasoning_only();
-        self.tool_round_reasoning_models = models;
+        self.tool_round_reasoning_default = default_enabled;
+        self.tool_round_reasoning_exceptions = model_exceptions;
         let enabled = self.tool_round_reasoning_only();
         if previously_enabled != enabled || self.context_state.reasoning_projected != enabled {
             self.refresh_local_context_estimate();
@@ -396,7 +405,8 @@ impl AgentEngine {
     }
 
     fn tool_round_reasoning_only(&self) -> bool {
-        self.chat_completions && self.tool_round_reasoning_models.contains(&self.model)
+        self.chat_completions
+            && (self.tool_round_reasoning_default != self.tool_round_reasoning_exceptions.contains(&self.model))
     }
 
     fn refresh_reasoning_projection_if_changed(&mut self) {
