@@ -1,6 +1,6 @@
 use super::{
-    AgentEngine, AgentError, CacheBreakDetector, CompactLevel, CompactState, ProviderCompat, build_assistant_content,
-    merge_tool_results, tool_call_malformed_fingerprint,
+    AgentEngine, AgentError, CacheBreakDetector, CompactLevel, CompactState, ProviderCompat, RunHistory,
+    build_assistant_content, merge_tool_results, tool_call_malformed_fingerprint,
 };
 
 // ---------------------------------------------------------------------------
@@ -53,6 +53,8 @@ mod tests_set_config {
             max_tokens: Some(4096),
             thinking: None,
             compat: ProviderCompat::anthropic_defaults(),
+            chat_completions: false,
+            tool_round_reasoning_models: Default::default(),
             system_prompt: String::new(),
             reasoning_effort: None,
             messages: vec![],
@@ -536,6 +538,8 @@ mod tests_phase6 {
             max_tokens: Some(4096),
             thinking: None,
             compat: ProviderCompat::anthropic_defaults(),
+            chat_completions: false,
+            tool_round_reasoning_models: Default::default(),
             system_prompt: String::new(),
             reasoning_effort: None,
             messages: vec![],
@@ -690,11 +694,12 @@ mod tests_phase6 {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2 tests — run_compaction()
+// Phase 2 tests — request preparation and compaction
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests_compact {
+    use std::collections::HashSet;
     use std::env;
     use std::sync::{Arc, Mutex};
 
@@ -710,13 +715,14 @@ mod tests_compact {
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
-    use super::{CompactLevel, ProviderCompat};
+    use super::{CompactLevel, ProviderCompat, RunHistory};
     use crate::compact::auto::should_autocompact;
     use crate::compact::state::CompactState;
     use crate::confirm::ToolConfirmer;
     use crate::context_usage::{ContextState, ContextUsageSource};
     use crate::output::OutputSink;
     use crate::session::{Session, SessionManager};
+    use crate::turn::TurnKind;
 
     struct NullOutput;
     impl OutputSink for NullOutput {
@@ -804,6 +810,23 @@ mod tests_compact {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingSummaryProvider {
+        requests: Mutex<Vec<LlmRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RecordingSummaryProvider {
+        async fn stream(&self, request: &LlmRequest) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
+            self.requests.lock().unwrap().push(request.clone());
+            SuccessfulProvider {
+                usage: TokenUsage::default(),
+            }
+            .stream(request)
+            .await
+        }
+    }
+
     fn make_compact_engine(
         compact_config: CompactConfig,
         compact_state: CompactState,
@@ -824,6 +847,8 @@ mod tests_compact {
             max_tokens: Some(4096),
             thinking: None,
             compat: ProviderCompat::anthropic_defaults(),
+            chat_completions: false,
+            tool_round_reasoning_models: Default::default(),
             system_prompt: String::new(),
             reasoning_effort: None,
             messages,
@@ -919,6 +944,161 @@ mod tests_compact {
                 is_error: false,
             }],
         )
+    }
+
+    #[tokio::test]
+    async fn ordinary_request_ignores_archived_reasoning_and_old_watermark() {
+        let config = CompactConfig {
+            context_window: 400,
+            autocompact_threshold_pct: Some(50),
+            emergency_buffer: 40,
+            ..Default::default()
+        };
+        let mut engine = make_compact_engine(
+            config,
+            CompactState::new(),
+            vec![
+                Message::new(
+                    Role::Assistant,
+                    vec![
+                        ContentBlock::Thinking {
+                            thinking: "r".repeat(2000),
+                            signature: None,
+                        },
+                        ContentBlock::Text { text: "answer".into() },
+                    ],
+                ),
+                Message::new(Role::User, vec![ContentBlock::Text { text: "next".into() }]),
+            ],
+        );
+        engine.chat_completions = true;
+        engine.set_tool_round_reasoning_models(HashSet::from([engine.model.clone()]));
+        engine.context_state.replace_with_provider_usage(800);
+        engine.sync_compact_watermark();
+        let provider = Arc::new(RecordingRejectingProvider::default());
+        engine.provider = provider.clone();
+
+        let request = engine
+            .prepare_request(TurnKind::Normal, &mut RunHistory::default())
+            .await
+            .unwrap();
+
+        assert!(provider.requests.lock().unwrap().is_empty());
+        assert_eq!(engine.context_status().source, ContextUsageSource::LocalProjected);
+        assert_eq!(engine.context_status().context_usage, 3);
+        assert_eq!(request.messages[0].content.len(), 1);
+        assert!(matches!(engine.messages[0].content[0], ContentBlock::Thinking { .. }));
+
+        engine.set_tool_round_reasoning_models(HashSet::new());
+        assert_eq!(engine.context_status().context_usage, 503);
+    }
+
+    #[rstest::rstest]
+    #[case::continues_after_compaction(400)]
+    #[case::active_tool_chain_still_exceeds_emergency_limit(300)]
+    #[tokio::test]
+    async fn compaction_projects_archived_history_and_keeps_active_tool_chain(#[case] window: usize) {
+        let config = CompactConfig {
+            context_window: window,
+            autocompact_threshold_pct: Some(50),
+            emergency_buffer: 40,
+            ..Default::default()
+        };
+        let old = Message::new(
+            Role::Assistant,
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "old reasoning".into(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "old answer".into(),
+                },
+            ],
+        );
+        let user = Message::new(Role::User, vec![ContentBlock::Text { text: "read it".into() }]);
+        let mut assistant = tool_use_msg("call-1", "Read");
+        assistant.content.insert(
+            0,
+            ContentBlock::Thinking {
+                thinking: "r".repeat(850),
+                signature: None,
+            },
+        );
+        let tool = tool_result_msg("call-1", "data");
+        let active = vec![user, assistant, tool];
+        let mut messages = vec![old];
+        messages.extend(active.clone());
+        let mut engine = make_compact_engine(config, CompactState::new(), messages);
+        engine.chat_completions = true;
+        engine.set_tool_round_reasoning_models(HashSet::from([engine.model.clone()]));
+        let provider = Arc::new(RecordingSummaryProvider::default());
+        engine.provider = provider.clone();
+        let mut run_history = RunHistory {
+            start: 1,
+            tool_continuation: true,
+        };
+
+        let result = engine.prepare_request(TurnKind::Normal, &mut run_history).await;
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].messages.len(),
+            2,
+            "only archived history and summary prompt"
+        );
+        assert!(matches!(
+            requests[0].messages[0].content.as_slice(),
+            [ContentBlock::Text { text }] if text == "old answer"
+        ));
+        assert_eq!(run_history.start, 2);
+        assert_eq!(json!(engine.messages[run_history.start..]), json!(active));
+        assert_eq!(engine.context_state.compact_count, 1);
+        assert!(engine.context_status().context_usage > 212);
+        if window == 300 {
+            assert!(matches!(
+                result,
+                Err(super::AgentError::ContextTooLong { limit: 260, .. })
+            ));
+        } else {
+            assert_eq!(json!(result.unwrap().messages[run_history.start..]), json!(active));
+        }
+    }
+
+    #[tokio::test]
+    async fn context_details_and_manual_compaction_use_projected_reasoning() {
+        let output = Arc::new(RecordingOutput::default());
+        let messages = vec![
+            Message::new(Role::User, vec![ContentBlock::Text { text: "one".into() }]),
+            Message::new(
+                Role::Assistant,
+                vec![
+                    ContentBlock::Thinking {
+                        thinking: "r".repeat(2000),
+                        signature: None,
+                    },
+                    ContentBlock::Text { text: "answer".into() },
+                ],
+            ),
+            Message::new(Role::User, vec![ContentBlock::Text { text: "two".into() }]),
+        ];
+        let mut engine =
+            make_compact_engine_with_output(CompactConfig::default(), CompactState::new(), messages, output.clone());
+        engine.chat_completions = true;
+        engine.set_tool_round_reasoning_models(HashSet::from([engine.model.clone()]));
+        let provider = Arc::new(RecordingRejectingProvider::default());
+        engine.provider = provider.clone();
+
+        engine.run("/context all", "context").await.unwrap();
+        assert!(output.infos.lock().unwrap()[0].contains("#2 Assistant · 2 tokens"));
+        assert_eq!(engine.context_status().context_usage, 4);
+
+        engine.run("/compact", "compact").await.unwrap();
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].messages[1].content.len(), 1);
+        assert!(matches!(engine.messages[1].content[0], ContentBlock::Thinking { .. }));
     }
 
     #[test]
@@ -1253,7 +1433,9 @@ mod tests_compact {
         state.last_input_tokens = 198_000; // >= 197k limit
 
         let mut engine = make_compact_engine(config, state, vec![]);
-        let result = engine.run_compaction().await;
+        let result = engine
+            .prepare_request(TurnKind::Normal, &mut RunHistory::default())
+            .await;
 
         match result {
             Err(super::AgentError::ContextTooLong { input_tokens, limit }) => {
@@ -1273,7 +1455,12 @@ mod tests_compact {
         state.last_input_tokens = 190_000; // below 197k
 
         let mut engine = make_compact_engine(config, state, vec![]);
-        assert!(engine.run_compaction().await.is_ok());
+        assert!(
+            engine
+                .prepare_request(TurnKind::Normal, &mut RunHistory::default())
+                .await
+                .is_ok()
+        );
     }
 
     // -- Microcompact runs when count trigger fires --
@@ -1294,7 +1481,10 @@ mod tests_compact {
         let state = CompactState::new();
         let mut engine = make_compact_engine(config, state, messages);
 
-        engine.run_compaction().await.unwrap();
+        engine
+            .prepare_request(TurnKind::Normal, &mut RunHistory::default())
+            .await
+            .unwrap();
 
         let cleared_count = engine
             .messages
@@ -1328,7 +1518,10 @@ mod tests_compact {
         let mut engine = make_compact_engine(config, state, messages);
         engine.context_state.replace_with_provider_usage(1_000);
         engine.sync_compact_watermark();
-        engine.run_compaction().await.unwrap();
+        engine
+            .prepare_request(TurnKind::Normal, &mut RunHistory::default())
+            .await
+            .unwrap();
 
         // Last 3 tool results should be preserved
         let cleared_count = engine
@@ -1370,7 +1563,9 @@ mod tests_compact {
         engine.context_state.replace_with_provider_usage(198_000);
         engine.sync_compact_watermark();
 
-        let result = engine.run_compaction().await;
+        let result = engine
+            .prepare_request(TurnKind::Normal, &mut RunHistory::default())
+            .await;
 
         assert!(matches!(
             result,
@@ -1419,7 +1614,10 @@ mod tests_compact {
         engine.context_state.replace_with_provider_usage(60);
         engine.sync_compact_watermark();
 
-        engine.run_compaction().await.unwrap();
+        engine
+            .prepare_request(TurnKind::Normal, &mut RunHistory::default())
+            .await
+            .unwrap();
 
         assert_eq!(engine.context_state.compact_count, 1);
         assert_eq!(engine.context_state.source, ContextUsageSource::LocalProjected);
@@ -1450,7 +1648,10 @@ mod tests_compact {
         let state = CompactState::new();
 
         let mut engine = make_compact_engine(config, state, messages);
-        engine.run_compaction().await.unwrap();
+        engine
+            .prepare_request(TurnKind::Normal, &mut RunHistory::default())
+            .await
+            .unwrap();
 
         // Nothing should be cleared (microcompact skipped)
         let cleared_count = engine
@@ -1475,7 +1676,9 @@ mod tests_compact {
         state.last_input_tokens = 198_000;
 
         let mut engine = make_compact_engine(config, state, vec![]);
-        let result = engine.run_compaction().await;
+        let result = engine
+            .prepare_request(TurnKind::Normal, &mut RunHistory::default())
+            .await;
 
         assert!(
             matches!(result, Err(super::AgentError::ContextTooLong { .. })),
@@ -1491,7 +1694,12 @@ mod tests_compact {
         let state = CompactState::new(); // context_tokens = 0
 
         let mut engine = make_compact_engine(config, state, vec![]);
-        assert!(engine.run_compaction().await.is_ok());
+        assert!(
+            engine
+                .prepare_request(TurnKind::Normal, &mut RunHistory::default())
+                .await
+                .is_ok()
+        );
         assert_eq!(engine.compact_state.last_input_tokens, 0);
     }
 
@@ -1523,7 +1731,10 @@ mod tests_compact {
         engine.provider = provider.clone();
         engine.compat.image_input = Some(ImageInputCapability::Unsupported);
 
-        engine.run_compaction().await.unwrap();
+        engine
+            .prepare_request(TurnKind::Normal, &mut RunHistory::default())
+            .await
+            .unwrap();
 
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
@@ -1557,7 +1768,9 @@ mod tests_compact {
         state.consecutive_failures = 3; // circuit broken
 
         let mut engine = make_compact_engine(config, state, vec![]);
-        let result = engine.run_compaction().await;
+        let result = engine
+            .prepare_request(TurnKind::Normal, &mut RunHistory::default())
+            .await;
 
         // Auto is skipped due to circuit breaker; emergency fires
         assert!(matches!(result, Err(super::AgentError::ContextTooLong { .. })));
@@ -1614,6 +1827,8 @@ mod tests_plan_mode {
             max_tokens: Some(4096),
             thinking: None,
             compat: ProviderCompat::anthropic_defaults(),
+            chat_completions: false,
+            tool_round_reasoning_models: Default::default(),
             system_prompt: String::new(),
             reasoning_effort: None,
             messages: vec![],
@@ -1837,6 +2052,8 @@ mod tests_handle_command {
             max_tokens: Some(4096),
             thinking: None,
             compat: ProviderCompat::anthropic_defaults(),
+            chat_completions: false,
+            tool_round_reasoning_models: Default::default(),
             system_prompt: String::new(),
             reasoning_effort: None,
             messages: vec![],
@@ -2266,7 +2483,7 @@ mod tests_handle_command {
             }],
         ));
 
-        let request = engine.build_request(TurnKind::Normal);
+        let request = engine.build_request(TurnKind::Normal, &super::RunHistory::default());
 
         assert!(matches!(request.messages[0].content[0], ContentBlock::Text { .. }));
         assert!(matches!(engine.messages[0].content[0], ContentBlock::Image { .. }));
@@ -2292,7 +2509,7 @@ mod tests_handle_command {
         engine.model = "text-only-model".to_owned();
         engine.compat.image_input = Some(ImageInputCapability::Unsupported);
 
-        let request = engine.build_request(TurnKind::Normal);
+        let request = engine.build_request(TurnKind::Normal, &super::RunHistory::default());
 
         assert_eq!(request.model, "text-only-model");
         assert!(
@@ -2334,7 +2551,7 @@ mod tests_handle_command {
             }],
         ));
 
-        let request = engine.build_request(TurnKind::Normal);
+        let request = engine.build_request(TurnKind::Normal, &super::RunHistory::default());
 
         assert!(matches!(request.messages[0].content[0], ContentBlock::Text { .. }));
         assert!(matches!(engine.messages[0].content[0], ContentBlock::Image { .. }));
@@ -2862,6 +3079,8 @@ mod tests_tool_policy_enforcement {
         AgentEngine {
             provider: Arc::new(NullProvider),
             compat: ProviderCompat::anthropic_defaults(),
+            chat_completions: false,
+            tool_round_reasoning_models: Default::default(),
             thinking: None,
             system_prompt: String::new(),
             model: "test-model".to_string(),
@@ -2910,9 +3129,9 @@ mod tests_tool_policy_enforcement {
 
     #[test]
     fn build_request_only_advertises_policy_allowed_tools() {
-        let mut engine = make_engine(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let engine = make_engine(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
 
-        let request = engine.build_request(TurnKind::Normal);
+        let request = engine.build_request(TurnKind::Normal, &super::RunHistory::default());
         let tool_names: Vec<_> = request.tools.iter().map(|tool| tool.name.as_str()).collect();
 
         assert_eq!(tool_names, vec!["Read"]);
@@ -2930,11 +3149,11 @@ mod tests_tool_policy_enforcement {
         engine.tool_policy = ToolPolicy::allow_only(["Read", "ViewImage"]);
         engine.compat.image_input = Some(ImageInputCapability::Unsupported);
 
-        let text_only_request = engine.build_request(TurnKind::Normal);
+        let text_only_request = engine.build_request(TurnKind::Normal, &super::RunHistory::default());
         assert!(text_only_request.tools.iter().all(|tool| tool.name != "ViewImage"));
 
         engine.compat.image_input = Some(ImageInputCapability::Supported);
-        let vision_request = engine.build_request(TurnKind::Normal);
+        let vision_request = engine.build_request(TurnKind::Normal, &super::RunHistory::default());
         assert!(vision_request.tools.iter().any(|tool| tool.name == "ViewImage"));
     }
 

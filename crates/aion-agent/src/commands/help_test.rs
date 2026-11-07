@@ -66,6 +66,7 @@ mod tests {
 
         let mut ctx = CommandContext {
             messages: &mut messages,
+            projected_messages: None,
             compact_state: &mut state,
             compact_config: &config,
             provider,
@@ -106,6 +107,7 @@ mod tests {
 
         let mut ctx = CommandContext {
             messages: &mut messages,
+            projected_messages: None,
             compact_state: &mut state,
             compact_config: &config,
             provider,

@@ -33,6 +33,7 @@ pub enum CommandResult {
 /// Context passed to slash commands during execution.
 pub struct CommandContext<'a> {
     pub messages: &'a mut Vec<Message>,
+    pub(crate) projected_messages: Option<&'a [Message]>,
     pub compact_state: &'a mut CompactState,
     pub compact_config: &'a CompactConfig,
     pub provider: Arc<dyn LlmProvider>,

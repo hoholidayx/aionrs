@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::mem::replace;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -5,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::cache_diagnostics::{CacheBreakDetector, CacheDiagnostic, CacheStats};
 use crate::commands::{CommandContext, CommandRegistry, CommandResult, CommandSpec, SlashCommand, default_registry};
-use crate::compact::auto::{CompactError, autocompact, should_autocompact};
+use crate::compact::auto::{CompactError, autocompact, is_compact_boundary, should_autocompact};
 use crate::compact::emergency::is_at_emergency_limit;
 use crate::compact::estimate::{estimate_tokens_from_tool_image, estimate_tokens_from_tool_result};
 use crate::compact::micro::{microcompact, should_microcompact};
@@ -33,8 +34,8 @@ use crate::tool_policy::ToolPolicy;
 use crate::turn::{FinalizationReason, ToolLoopWarning, TurnGuardAction, TurnGuards, TurnKind, TurnOutcome};
 use aion_compact::CompactLevel;
 use aion_config::compact::CompactConfig;
-use aion_config::compat::ProviderCompat;
-use aion_config::config::{CompactContextWindowSource, Config};
+use aion_config::compat::{OpenAiApiMode, ProviderCompat};
+use aion_config::config::{CompactContextWindowSource, Config, ProviderType};
 use aion_config::hooks::HookEngine;
 use aion_protocol::ToolApprovalManager;
 use aion_protocol::events::ToolCategory;
@@ -51,6 +52,10 @@ use serde_json::to_string;
 use tokio::sync::mpsc::Receiver;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use uuid::Uuid;
+
+#[path = "reasoning_history.rs"]
+mod reasoning_history;
+use reasoning_history::{RunHistory, project_chat_reasoning};
 
 #[derive(Debug)]
 pub struct AgentResult {
@@ -72,6 +77,10 @@ pub struct AgentEngine {
     provider: Arc<dyn LlmProvider>,
     /// Resolved provider compatibility and capability settings.
     compat: ProviderCompat,
+    /// Provider wire format fixed at construction.
+    chat_completions: bool,
+    /// Model settings installed by the host between user runs.
+    tool_round_reasoning_models: HashSet<String>,
     /// Optional provider-neutral thinking configuration for model requests.
     thinking: Option<ThinkingConfig>,
     /// Base system prompt sent with each model request.
@@ -209,6 +218,9 @@ impl AgentEngine {
             max_tokens: config.max_tokens,
             thinking: config.thinking,
             compat: config.compat.clone(),
+            chat_completions: config.provider == ProviderType::OpenAI
+                && config.compat.openai_api_mode() == OpenAiApiMode::ChatCompletions,
+            tool_round_reasoning_models: HashSet::new(),
             system_prompt,
             reasoning_effort: None,
             messages: Vec::new(),
@@ -308,6 +320,9 @@ impl AgentEngine {
             max_tokens: config.max_tokens,
             thinking: config.thinking,
             compat: config.compat.clone(),
+            chat_completions: config.provider == ProviderType::OpenAI
+                && config.compat.openai_api_mode() == OpenAiApiMode::ChatCompletions,
+            tool_round_reasoning_models: HashSet::new(),
             system_prompt,
             reasoning_effort: None,
             messages: session.messages.clone(),
@@ -344,7 +359,8 @@ impl AgentEngine {
             cache_detector: CacheBreakDetector::new(),
             commands: default_registry(),
         };
-        if engine.context_state.context_usage == 0 {
+        if engine.context_state.context_usage == 0 || engine.context_state.reasoning_projected {
+            // A restored runtime starts without a model settings snapshot or a live tool chain.
             engine.refresh_local_context_estimate();
         }
         engine
@@ -362,6 +378,31 @@ impl AgentEngine {
     /// Get a reference to the resolved compat settings
     pub fn compat(&self) -> &ProviderCompat {
         &self.compat
+    }
+
+    /// Whether this engine sends the Chat Completions reasoning field.
+    pub fn supports_tool_round_reasoning_policy(&self) -> bool {
+        self.chat_completions
+    }
+
+    /// Install a provider's model settings snapshot between user runs.
+    pub fn set_tool_round_reasoning_models(&mut self, models: HashSet<String>) {
+        let previously_enabled = self.tool_round_reasoning_only();
+        self.tool_round_reasoning_models = models;
+        let enabled = self.tool_round_reasoning_only();
+        if previously_enabled != enabled || self.context_state.reasoning_projected != enabled {
+            self.refresh_local_context_estimate();
+        }
+    }
+
+    fn tool_round_reasoning_only(&self) -> bool {
+        self.chat_completions && self.tool_round_reasoning_models.contains(&self.model)
+    }
+
+    fn refresh_reasoning_projection_if_changed(&mut self) {
+        if self.context_state.reasoning_projected != self.tool_round_reasoning_only() {
+            self.refresh_local_context_estimate();
+        }
     }
 
     pub fn tool_names(&self) -> Vec<String> {
@@ -483,7 +524,11 @@ impl AgentEngine {
             session_id = %session_id,
             msg_id = %msg_id,
         );
-        self.run_inner(content_blocks, msg_id).instrument(span).await
+        let result = self.run_inner(content_blocks, msg_id).instrument(span).await;
+        if result.is_err() && self.tool_round_reasoning_only() {
+            self.save_idle_context();
+        }
+        result
     }
 
     /// Set the turn id for the NEXT run. Hosts that mint their own turn ids
@@ -515,10 +560,14 @@ impl AgentEngine {
         );
         self.output.emit_stream_start(msg_id);
 
+        let mut run_history = RunHistory {
+            start: self.messages.len(),
+            ..RunHistory::default()
+        };
         let user_tokens = estimate_content_tokens(&content_blocks);
         self.push_history(Role::User, content_blocks);
         self.record_local_context_addition(user_tokens);
-        self.save_session();
+        self.save_idle_context();
 
         let mut guards = TurnGuards::new(
             self.max_turns_per_run,
@@ -527,7 +576,7 @@ impl AgentEngine {
         );
         loop {
             if let Some(limit) = guards.turn_budget_reached() {
-                self.save_session();
+                self.save_idle_context();
                 let message = format!(
                     "Stopped after reaching the turn budget (max_turns={limit}); the task did not converge. Try adjusting the request or retrying."
                 );
@@ -541,7 +590,8 @@ impl AgentEngine {
                 });
             }
 
-            let outcome = self.run_turn(TurnKind::Normal).await?;
+            let outcome = self.run_turn(TurnKind::Normal, &mut run_history).await?;
+            run_history.tool_continuation = false;
             guards.record_counted_turn();
 
             let tool_calls = match TurnOutcome::from_stream(outcome) {
@@ -554,7 +604,7 @@ impl AgentEngine {
                 TurnOutcome::Final(outcome) => {
                     let assistant_content = build_assistant_content(&outcome);
                     self.push_history(Role::Assistant, assistant_content);
-                    self.save_session();
+                    self.save_idle_context();
                     return Ok(AgentResult {
                         text: outcome.assistant_text,
                         stop_reason: outcome.stop_reason,
@@ -572,6 +622,7 @@ impl AgentEngine {
                             outcome.assistant_text,
                             guards.counted_turns(),
                             StopReason::MaxTokens,
+                            &mut run_history,
                         )
                         .await;
                 }
@@ -593,6 +644,7 @@ impl AgentEngine {
                                 outcome.assistant_text,
                                 guards.counted_turns(),
                                 StopReason::EndTurn,
+                                &mut run_history,
                             )
                             .await;
                     }
@@ -640,6 +692,7 @@ impl AgentEngine {
             if !follow_up_blocks.is_empty() {
                 self.push_history(Role::User, follow_up_blocks);
             }
+            run_history.tool_continuation = true;
 
             // Save session after each tool round.
             self.save_session();
@@ -648,7 +701,13 @@ impl AgentEngine {
                 TurnGuardAction::Continue | TurnGuardAction::Warn(_) => {}
                 TurnGuardAction::Finalize(reason) => {
                     return self
-                        .finalize_once(reason, String::new(), guards.counted_turns(), StopReason::MaxTurns)
+                        .finalize_once(
+                            reason,
+                            String::new(),
+                            guards.counted_turns(),
+                            StopReason::MaxTurns,
+                            &mut run_history,
+                        )
                         .await;
                 }
                 TurnGuardAction::Stop(err) => return Err(err),
@@ -656,10 +715,8 @@ impl AgentEngine {
         }
     }
 
-    /// Build the next provider request, applying plan-mode tool/system filtering
-    /// and recording the prompt state for cache diagnostics.
-    fn build_request(&mut self, kind: TurnKind) -> LlmRequest {
-        let image_input = self.compat.image_input();
+    /// Build the next provider request from a projected copy of history.
+    fn build_request(&self, kind: TurnKind, run_history: &RunHistory) -> LlmRequest {
         let tools = self.tool_definitions_for_turn(kind);
 
         // Build system prompt: append plan mode instructions when active
@@ -669,10 +726,7 @@ impl AgentEngine {
             self.system_prompt.clone()
         };
 
-        // Record prompt state for cache diagnostics
-        self.cache_detector.record_request(&system, &tools);
-
-        let mut messages = self.messages.clone();
+        let mut messages = self.project_messages(&self.messages, run_history.replay_start());
         if let Some(prompt) = kind.control_prompt() {
             messages.push(Message::now(
                 Role::User,
@@ -681,8 +735,6 @@ impl AgentEngine {
                 }],
             ));
         }
-        project_image_input(&mut messages, image_input, &self.model);
-
         LlmRequest {
             model: self.model.clone(),
             system,
@@ -692,6 +744,15 @@ impl AgentEngine {
             thinking: self.thinking.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
         }
+    }
+
+    fn project_messages(&self, history: &[Message], replay_start: Option<usize>) -> Vec<Message> {
+        let mut messages = history.to_vec();
+        if self.tool_round_reasoning_only() {
+            project_chat_reasoning(&mut messages, replay_start);
+        }
+        project_image_input(&mut messages, self.compat.image_input(), &self.model);
+        messages
     }
 
     fn tool_definitions_for_turn(&self, kind: TurnKind) -> Vec<ToolDef> {
@@ -885,7 +946,7 @@ impl AgentEngine {
         }
     }
 
-    async fn run_turn(&mut self, kind: TurnKind) -> Result<StreamOutcome, AgentError> {
+    async fn run_turn(&mut self, kind: TurnKind, run_history: &mut RunHistory) -> Result<StreamOutcome, AgentError> {
         let span = info_span!(
             target: "aion_agent",
             "llm_generation",
@@ -893,15 +954,12 @@ impl AgentEngine {
             tools_disabled = kind.disable_tools(),
         );
         async {
-            // Run multi-level compaction before each API call.
-            // On the first model turn context_tokens is 0 so neither
-            // autocompact nor emergency will fire.
-            self.run_compaction().await?;
-            let request = self.build_request(kind);
+            let request = self.prepare_request(kind, run_history).await?;
+            self.cache_detector.record_request(&request.system, &request.tools);
             let mut rx = self.provider.stream(&request).await?;
             let outcome = self.consume_stream(&mut rx).await?;
             let has_provider_usage = self.record_turn_usage(&outcome.usage);
-            if !has_provider_usage {
+            if !has_provider_usage && !self.tool_round_reasoning_only() {
                 let assistant_content = build_assistant_content(&outcome);
                 self.record_local_context_addition(estimate_content_tokens(&assistant_content));
             }
@@ -917,8 +975,9 @@ impl AgentEngine {
         prefix_text: String,
         counted_turns: usize,
         fallback_stop_reason: StopReason,
+        run_history: &mut RunHistory,
     ) -> Result<AgentResult, AgentError> {
-        let outcome = self.run_turn(TurnKind::Finalization(reason)).await?;
+        let outcome = self.run_turn(TurnKind::Finalization(reason), run_history).await?;
         let combined_text = format!("{}{}", prefix_text, outcome.assistant_text);
         let is_success = outcome.tool_calls.is_empty()
             && outcome.stop_reason == StopReason::EndTurn
@@ -927,7 +986,7 @@ impl AgentEngine {
         if is_success {
             let assistant_content = build_assistant_content(&outcome);
             self.push_history(Role::Assistant, assistant_content);
-            self.save_session();
+            self.save_idle_context();
             return Ok(AgentResult {
                 text: combined_text,
                 stop_reason: StopReason::EndTurn,
@@ -959,7 +1018,7 @@ impl AgentEngine {
                 text: fallback_text.clone(),
             }],
         );
-        self.save_session();
+        self.save_idle_context();
         Ok(AgentResult {
             text: fallback_text,
             stop_reason: fallback_stop_reason,
@@ -1041,8 +1100,7 @@ impl AgentEngine {
         })
     }
 
-    /// Fold one turn's token usage into the running totals and replace the
-    /// best-known context size with the provider's exact turn total.
+    /// Record reported usage independently of how the next context size is estimated.
     fn record_turn_usage(&mut self, turn_usage: &TokenUsage) -> bool {
         self.total_usage.input_tokens += turn_usage.input_tokens;
         self.total_usage.output_tokens += turn_usage.output_tokens;
@@ -1055,8 +1113,10 @@ impl AgentEngine {
             return false;
         }
 
-        self.context_state.replace_with_provider_usage(context_usage);
-        self.sync_compact_watermark();
+        if !self.tool_round_reasoning_only() {
+            self.context_state.replace_with_provider_usage(context_usage);
+            self.sync_compact_watermark();
+        }
 
         // Cache break detection
         let cache_stats = CacheStats {
@@ -1090,6 +1150,9 @@ impl AgentEngine {
     /// tool result is estimated once; tool-emitted images are counted because
     /// they are also sent in the next provider request.
     fn record_tool_context_estimate(&mut self, tool_results: &[ContentBlock], tool_images: &[ContentBlock]) {
+        if self.tool_round_reasoning_only() {
+            return;
+        }
         let tool_result_tokens = tool_results.iter().fold(0_u64, |total, result| {
             total.saturating_add(estimate_tokens_from_tool_result(result))
         });
@@ -1109,8 +1172,10 @@ impl AgentEngine {
     }
 
     fn record_local_context_addition(&mut self, tokens: u64) {
-        self.context_state.add_local_estimate(tokens);
-        self.sync_compact_watermark();
+        if !self.tool_round_reasoning_only() {
+            self.context_state.add_local_estimate(tokens);
+            self.sync_compact_watermark();
+        }
     }
 
     fn sync_compact_watermark(&mut self) {
@@ -1118,6 +1183,12 @@ impl AgentEngine {
     }
 
     fn refresh_local_context_estimate(&mut self) {
+        if self.tool_round_reasoning_only() {
+            let request = self.build_request(TurnKind::Normal, &RunHistory::default());
+            self.record_projected_request_context(&request);
+            return;
+        }
+
         let tools = self.tool_definitions_for_turn(TurnKind::Normal);
         let dynamic_system_tokens = self.dynamic_system_tokens();
         let context_usage = self
@@ -1127,6 +1198,21 @@ impl AgentEngine {
             .saturating_add(estimate_tool_definitions_tokens(&tools))
             .saturating_add(estimate_messages_tokens(&self.messages));
         self.context_state.replace_with_local_estimate(context_usage);
+        self.context_state.reasoning_projected = false;
+        self.sync_compact_watermark();
+    }
+
+    fn record_projected_request_context(&mut self, request: &LlmRequest) {
+        let tools = if self.compat.emit_tools() {
+            &request.tools[..]
+        } else {
+            &[]
+        };
+        let context_usage = estimate_text_tokens(&request.system)
+            .saturating_add(estimate_tool_definitions_tokens(tools))
+            .saturating_add(estimate_messages_tokens(&request.messages));
+        self.context_state.replace_with_local_estimate(context_usage);
+        self.context_state.reasoning_projected = true;
         self.sync_compact_watermark();
     }
 
@@ -1138,12 +1224,13 @@ impl AgentEngine {
         }
     }
 
-    /// Run context compaction guards before each API call.
-    ///
-    /// Execution order: optional legacy microcompact → autocompact → emergency check.
-    /// After a successful autocompact the emergency check is skipped
-    /// because the context has been significantly reduced.
-    async fn run_compaction(&mut self) -> Result<(), AgentError> {
+    /// Apply compaction guards and return the request that passed them.
+    async fn prepare_request(
+        &mut self,
+        kind: TurnKind,
+        run_history: &mut RunHistory,
+    ) -> Result<LlmRequest, AgentError> {
+        let mut microcompacted = false;
         // 1. Microcompact (lightweight, no LLM call)
         if self.compact_config.microcompact_enabled && should_microcompact(&self.messages, &self.compact_config) {
             let result = microcompact(&mut self.messages, &self.compact_config);
@@ -1154,13 +1241,33 @@ impl AgentEngine {
                 ));
                 self.context_state.record_microcompact();
                 self.sync_compact_watermark();
-                self.save_session();
+                microcompacted = true;
             }
+        }
+
+        let mut projected_request = self
+            .tool_round_reasoning_only()
+            .then(|| self.build_request(kind, run_history));
+        if let Some(request) = &projected_request {
+            self.record_projected_request_context(request);
+        }
+        if microcompacted {
+            self.save_session();
         }
 
         // 2. Autocompact (LLM summarization)
         let mut compacted = false;
-        let should_compact = should_autocompact(self.compact_state.last_input_tokens, &self.compact_config);
+        let preserve_run = projected_request.is_some() && run_history.tool_continuation;
+        let history_end = if preserve_run {
+            run_history.start
+        } else {
+            self.messages.len()
+        };
+        let history = &self.messages[..history_end];
+        let summary_only = history.len() == 2 && is_compact_boundary(&history[0]);
+        let has_history_to_compact = !preserve_run || !(history.is_empty() || summary_only);
+        let should_compact =
+            has_history_to_compact && should_autocompact(self.compact_state.last_input_tokens, &self.compact_config);
         if should_compact {
             info!(target: "aion_agent", context_tokens = self.compact_state.last_input_tokens, "context compaction triggered");
             let threshold = if let Some(pct) = self.compact_config.autocompact_threshold_pct {
@@ -1180,8 +1287,7 @@ impl AgentEngine {
         }
         if should_compact && !self.compact_state.is_circuit_broken(&self.compact_config) {
             let provider = Arc::clone(&self.provider);
-            let mut compact_messages = self.messages.clone();
-            project_image_input(&mut compact_messages, self.compat.image_input(), &self.model);
+            let compact_messages = self.project_messages(history, None);
             match autocompact(
                 provider.as_ref(),
                 &compact_messages,
@@ -1196,9 +1302,18 @@ impl AgentEngine {
                         "Autocompact: summarized {} messages ({} tokens → compact)",
                         result.messages_summarized, result.pre_compact_tokens
                     ));
+                    let active_messages = self.messages.split_off(history_end);
                     self.messages = result.messages;
+                    run_history.start = self.messages.len();
+                    self.messages.extend(active_messages);
                     self.context_state.record_compact();
-                    self.refresh_local_context_estimate();
+                    if projected_request.is_some() {
+                        let request = self.build_request(kind, run_history);
+                        self.record_projected_request_context(&request);
+                        projected_request = Some(request);
+                    } else {
+                        self.refresh_local_context_estimate();
+                    }
                     self.save_session();
                     compacted = true;
                 }
@@ -1233,8 +1348,10 @@ impl AgentEngine {
             }
         }
 
-        // 3. Emergency check (skip if autocompact just succeeded)
-        if !compacted && is_at_emergency_limit(self.compact_state.last_input_tokens, &self.compact_config) {
+        // 3. An active tool chain may still fill the window after its prefix was compacted.
+        if (!compacted || projected_request.is_some())
+            && is_at_emergency_limit(self.compact_state.last_input_tokens, &self.compact_config)
+        {
             return Err(AgentError::ContextTooLong {
                 input_tokens: self.compact_state.last_input_tokens,
                 limit: self
@@ -1244,7 +1361,7 @@ impl AgentEngine {
             });
         }
 
-        Ok(())
+        Ok(projected_request.unwrap_or_else(|| self.build_request(kind, run_history)))
     }
 }
 
@@ -1436,6 +1553,7 @@ impl AgentEngine {
         }
 
         if model_changed {
+            self.refresh_reasoning_projection_if_changed();
             self.save_session();
         }
 
@@ -1488,7 +1606,13 @@ impl AgentEngine {
 
     async fn execute_command(&mut self, command: ParsedSlashCommand<'_>) -> Option<Result<CommandResult, AnyhowError>> {
         let cmd = self.commands.find(command.name)?;
-        let context_tools = self.tool_definitions_for_turn(TurnKind::Normal);
+        let project_reasoning = self.tool_round_reasoning_only();
+        let context_tools = if project_reasoning && !self.compat.emit_tools() {
+            Vec::new()
+        } else {
+            self.tool_definitions_for_turn(TurnKind::Normal)
+        };
+        let projected_messages = project_reasoning.then(|| self.project_messages(&self.messages, None));
         let dynamic_system_tokens = self.dynamic_system_tokens();
 
         // We need to borrow self mutably for CommandContext while also
@@ -1499,6 +1623,7 @@ impl AgentEngine {
 
         let mut ctx = CommandContext {
             messages: &mut self.messages,
+            projected_messages: projected_messages.as_deref(),
             compact_state: &mut self.compact_state,
             compact_config: &self.compact_config,
             provider: Arc::clone(&self.provider),
@@ -1572,7 +1697,16 @@ impl AgentEngine {
         }
         if request_shape_changed {
             self.refresh_local_context_estimate();
+        } else {
+            self.refresh_reasoning_projection_if_changed();
         }
+    }
+
+    fn save_idle_context(&mut self) {
+        if self.tool_round_reasoning_only() {
+            self.refresh_local_context_estimate();
+        }
+        self.save_session();
     }
 
     fn save_session(&mut self) {
@@ -1595,11 +1729,17 @@ impl AgentEngine {
     /// already be in memory without its matching results. Add synthetic error
     /// results so the next request can safely reuse this history.
     pub fn abort_current_turn(&mut self, reason: &str) {
+        if self.close_pending_tool_calls(reason) || self.tool_round_reasoning_only() {
+            self.save_idle_context();
+        }
+    }
+
+    fn close_pending_tool_calls(&mut self, reason: &str) -> bool {
         let Some(last_message) = self.messages.last() else {
-            return;
+            return false;
         };
         if last_message.role != Role::Assistant {
-            return;
+            return false;
         }
 
         let pending_results: Vec<_> = last_message
@@ -1614,7 +1754,7 @@ impl AgentEngine {
             .collect();
 
         if pending_results.is_empty() {
-            return;
+            return false;
         }
 
         let result_blocks: Vec<ContentBlock> = pending_results
@@ -1637,7 +1777,7 @@ impl AgentEngine {
 
         self.record_tool_context_estimate(&result_blocks, &[]);
         self.push_history(Role::User, result_blocks);
-        self.save_session();
+        true
     }
 
     /// Run stop hooks when the agent session ends

@@ -30,7 +30,7 @@ impl SlashCommand for CompactCommand {
 
         match auto::autocompact(
             ctx.provider.as_ref(),
-            ctx.messages,
+            ctx.projected_messages.unwrap_or(ctx.messages.as_slice()),
             ctx.model,
             ctx.compact_config,
             ctx.compact_state,

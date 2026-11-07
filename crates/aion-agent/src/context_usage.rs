@@ -33,6 +33,9 @@ pub struct ContextState {
     /// Whether `context_usage` is provider-reported or locally projected.
     #[serde(default)]
     pub source: ContextUsageSource,
+    /// Whether the stored estimate excludes history under the tool-round policy.
+    #[serde(skip_serializing_if = "is_false")]
+    pub(crate) reasoning_projected: bool,
     /// Number of successful full compactions in this session.
     #[serde(default)]
     pub compact_count: u64,
@@ -87,11 +90,16 @@ impl Default for ContextState {
             schema_version: CONTEXT_STATE_SCHEMA_VERSION,
             context_usage: 0,
             source: ContextUsageSource::LocalProjected,
+            reasoning_projected: false,
             compact_count: 0,
             microcompact_count: 0,
             updated_at: Utc::now(),
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Runtime context status exposed to SDK hosts without persisting model limits.

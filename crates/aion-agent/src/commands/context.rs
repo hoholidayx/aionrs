@@ -39,7 +39,7 @@ impl SlashCommand for ContextCommand {
             ctx.prompt_usage,
             ctx.dynamic_system_tokens,
             ctx.context_tools,
-            ctx.messages,
+            ctx.projected_messages.unwrap_or(ctx.messages.as_slice()),
         );
         ctx.output.emit_info(&format_snapshot(&snapshot, expanded));
         Ok(CommandResult::Continue)
