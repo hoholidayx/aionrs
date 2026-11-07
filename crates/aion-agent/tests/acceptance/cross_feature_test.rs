@@ -53,10 +53,10 @@ async fn tc_ax_01_multi_feature_collaboration() {
         "system prompt should reference the memory entry file"
     );
 
-    // Assert: system prompt contains tool guidance
+    // The fallback identity precedes the environment and memory.
     assert!(
-        system_prompt.contains("# Using your tools"),
-        "system prompt should contain tool usage guidance heading"
+        system_prompt.starts_with("You are an AI assistant that can use tools to help with tasks."),
+        "system prompt should lead with the fallback identity"
     );
 
     // ── Step 3: ReadTool dedup via FileStateCache ──

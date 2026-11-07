@@ -1,9 +1,16 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aion_agent::bootstrap::AgentBootstrap;
 use aion_agent::output::null_sink::NullSink;
 use aion_config::compat::ProviderCompat;
 use aion_config::config::{Config, ProviderType};
+use aion_providers::error::ProviderError;
+use aion_providers::provider::LlmProvider;
+use aion_types::llm::{LlmEvent, LlmRequest};
+use aion_types::message::{StopReason, TokenUsage};
+use async_trait::async_trait;
+use serde_json::json;
+use tokio::sync::mpsc;
 
 fn minimal_config() -> Config {
     Config {
@@ -39,17 +46,129 @@ fn null_output() -> Arc<dyn aion_agent::output::OutputSink> {
     Arc::new(NullSink)
 }
 
+#[derive(Default)]
+struct RecordingProvider {
+    enter_plan: bool,
+    requests: Mutex<Vec<LlmRequest>>,
+}
+
+#[async_trait]
+impl LlmProvider for RecordingProvider {
+    async fn stream(&self, request: &LlmRequest) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
+        let first_request = {
+            let mut requests = self.requests.lock().unwrap();
+            let first_request = requests.is_empty();
+            requests.push(request.clone());
+            first_request
+        };
+        let (tx, rx) = mpsc::channel(2);
+        let (event, stop_reason) = if self.enter_plan && first_request {
+            (
+                LlmEvent::ToolUse {
+                    id: "call_enter_plan".into(),
+                    name: "EnterPlanMode".into(),
+                    input: json!({}),
+                    extra: None,
+                },
+                StopReason::ToolUse,
+            )
+        } else {
+            (LlmEvent::TextDelta("Ready".into()), StopReason::EndTurn)
+        };
+        tx.send(event).await.unwrap();
+        tx.send(LlmEvent::Done {
+            stop_reason,
+            usage: TokenUsage::default(),
+        })
+        .await
+        .unwrap();
+        Ok(rx)
+    }
+}
+
 #[tokio::test]
-async fn bootstrap_builds_engine_with_model_in_prompt() {
-    let config = minimal_config();
-    let result = AgentBootstrap::new(config, "/tmp/test-workspace", null_output())
+async fn skills_index_without_rules_keeps_default_identity_in_provider_request() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let provider = Arc::new(RecordingProvider::default());
+    let mut config = minimal_config();
+    let skills_index = "## Available Skills\n- Test skill";
+    config.system_prompt = Some(skills_index.into());
+    let mut result = AgentBootstrap::new(config, workspace.path().to_string_lossy(), null_output())
+        .custom_prompt_has_instructions(false)
+        .provider(provider.clone())
         .build()
         .await
-        .expect("bootstrap should succeed");
+        .unwrap();
+    result.engine.run("Test", "msg-1").await.unwrap();
 
-    assert!(!result.engine.tool_names().is_empty());
-    assert!(!result.has_mcp);
-    assert!(result.mcp_managers.is_empty());
+    let requests = provider.requests.lock().unwrap();
+    let [request] = requests.as_slice() else {
+        panic!("expected one model request");
+    };
+    assert_eq!(request.model, "gpt-test-model");
+    assert!(request.system.starts_with(&format!(
+        "You are an AI assistant that can use tools to help with tasks.\nYou are powered by the model gpt-test-model.\n\n{skills_index}\n\nWorking directory:"
+    )));
+    for absent in ["# Using your tools", "Current date:"] {
+        assert!(!request.system.contains(absent));
+    }
+}
+
+#[tokio::test]
+async fn custom_prompt_stays_first_in_normal_and_plan_requests() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let provider = Arc::new(RecordingProvider {
+        enter_plan: true,
+        ..Default::default()
+    });
+    let mut config = minimal_config();
+    let custom = "Custom assistant rules\n\n## Available Skills\n- Test skill";
+    config.system_prompt = Some(custom.into());
+    config.tools.auto_approve = true;
+    let mut result = AgentBootstrap::new(config, workspace.path().to_string_lossy(), null_output())
+        .custom_prompt_has_instructions(true)
+        .provider(provider.clone())
+        .build()
+        .await
+        .unwrap();
+    result.engine.run("Plan this task", "msg-1").await.unwrap();
+
+    let requests = provider.requests.lock().unwrap();
+    let [normal, planning] = requests.as_slice() else {
+        panic!("expected a normal request and a plan-mode request");
+    };
+    for request in [normal, planning] {
+        assert_eq!(request.model, "gpt-test-model");
+        assert!(request.system.starts_with(&format!("{custom}\n\nWorking directory:")));
+        for label in [
+            "Operating system:",
+            "Architecture:",
+            "Default shell:",
+            "Shell path:",
+            "Shell syntax:",
+        ] {
+            assert!(request.system.contains(label), "missing {label}");
+        }
+        for absent in [
+            "You are an AI assistant",
+            "You are powered by the model",
+            "Current date:",
+            "# Using your tools",
+        ] {
+            assert!(!request.system.contains(absent));
+        }
+        assert!(request.tools.iter().any(|tool| tool.name == "Read"));
+    }
+    assert!(!normal.system.contains("# Plan Mode"));
+    assert!(normal.tools.iter().any(|tool| tool.name == "EnterPlanMode"));
+    assert!(normal.tools.iter().any(|tool| tool.name == "Write"));
+    assert!(
+        planning
+            .system
+            .starts_with(&format!("{}\n\n# Plan Mode", normal.system))
+    );
+    assert!(planning.tools.iter().any(|tool| tool.name == "ExitPlanMode"));
+    assert!(!planning.tools.iter().any(|tool| tool.name == "Write"));
 }
 
 #[tokio::test]

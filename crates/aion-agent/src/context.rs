@@ -13,7 +13,7 @@ use crate::tool_policy::ToolPolicy;
 
 /// Session-scoped cache for system prompt sections.
 ///
-/// Each section (intro, tool guidance, AGENTS.md, memory, skills) is cached
+/// Each section (identity, custom, environment, AGENTS.md, memory, skills) is cached
 /// independently. The `joined` field holds the pre-joined full prompt string
 /// and is invalidated whenever any section changes.
 pub struct SystemPromptCache {
@@ -25,9 +25,9 @@ pub struct SystemPromptCache {
     pub(crate) last_plan_mode: bool,
     /// Track last toon_enabled value to detect changes.
     pub(crate) last_toon_enabled: bool,
-    /// Track shell prompt text to invalidate intro when shell resolution changes.
-    pub(crate) last_shell_prompt: Option<String>,
-    /// Track runtime tool authorization to keep guidance and skill reminders aligned.
+    /// Track the fallback model to invalidate the identity when it changes.
+    last_fallback_model: Option<String>,
+    /// Track runtime tool authorization to keep skill reminders aligned.
     pub(crate) last_tool_policy: ToolPolicy,
 }
 
@@ -38,7 +38,7 @@ impl SystemPromptCache {
             joined: None,
             last_plan_mode: false,
             last_toon_enabled: false,
-            last_shell_prompt: None,
+            last_fallback_model: None,
             last_tool_policy: ToolPolicy::default(),
         }
     }
@@ -62,88 +62,11 @@ impl Default for SystemPromptCache {
     }
 }
 
-/// Return the tool-usage guidance section for the system prompt.
-///
-/// For unrestricted agents this includes the full cross-tool guidance. For
-/// restricted agents it only names tools authorized by the runtime policy.
-fn tool_usage_guidance(tool_policy: &ToolPolicy) -> String {
-    if matches!(tool_policy, ToolPolicy::Unrestricted) {
-        return "\
-# Using your tools
- - Do NOT use ExecCommand when a dedicated tool is available. Using dedicated tools \
-allows the user to better understand and review your work:
-   - File search: Glob (not find or ls)
-   - Content search: Grep (not grep or rg)
-   - Read files: Read (not cat, head, or tail)
-   - Edit files: Edit (not sed or awk)
-   - Write files: Write (not echo redirection or cat with heredoc)
- - You can call multiple tools in a single response. If there are no \
-dependencies between them, make all independent calls in parallel. \
-However, if one call depends on a previous result, run them sequentially.
- - Prefer Edit over Write for modifying existing files — Edit sends only \
-the diff, which is easier to review.
- - Always Read a file before editing it.
- - Some tools are deferred — only their names are visible. Before calling \
-a deferred tool, use ToolSearch to load its full schema first."
-            .to_string();
-    }
-
-    let mut guidance = vec!["# Using your tools".to_string()];
-    let dedicated_tools = [
-        ("Glob", "File search: Glob"),
-        ("Grep", "Content search: Grep"),
-        ("Read", "Read files: Read"),
-        ("Edit", "Edit files: Edit"),
-        ("Write", "Write files: Write"),
-    ]
-    .into_iter()
-    .filter_map(|(name, text)| tool_policy.allows(name).then_some(text))
-    .collect::<Vec<_>>();
-
-    if !dedicated_tools.is_empty() {
-        guidance.push(" - Use the available dedicated workspace tools when they fit the task:".to_string());
-        guidance.extend(dedicated_tools.into_iter().map(|tool| format!("   - {tool}")));
-    }
-
-    guidance.push(
-        " - You can call multiple tools in a single response. If there are no dependencies between them, make all independent calls in parallel. However, if one call depends on a previous result, run them sequentially."
-            .to_string(),
-    );
-
-    if tool_policy.allows("Edit") && tool_policy.allows("Write") {
-        guidance.push(
-            " - Prefer Edit over Write for modifying existing files — Edit sends only the diff, which is easier to review."
-                .to_string(),
-        );
-    }
-    if tool_policy.allows("Read") && tool_policy.allows("Edit") {
-        guidance.push(" - Always Read a file before editing it.".to_string());
-    }
-    if tool_policy.allows("ToolSearch") {
-        guidance.push(
-            " - Some tools are deferred — only their names are visible. Before calling a deferred tool, use ToolSearch to load its full schema first."
-                .to_string(),
-        );
-    }
-
-    guidance.join("\n")
-}
-
 /// Build the system prompt from config and environment.
 ///
-/// Sections are assembled in this order:
-/// 1. Base intro (role, model identity, working directory, date)
-/// 2. Tool usage guidance (dedicated tools, parallel calls, etc.)
-/// 3. Custom prompt (user config)
-/// 4. AGENTS.md (project instructions)
-/// 5. Memory system prompt (behavioral instructions + MEMORY.md content)
-/// 6. Plan mode instructions (when active)
-/// 7. Skills reminder (available skills listing)
-///
-/// Session-permanent sections (intro, tool guidance, custom prompt, AGENTS.md)
-/// are cached in `cache.sections` and reused across calls. The `joined` field
-/// caches the final concatenated result; it is returned on subsequent calls
-/// unless a dynamic input such as plan mode or tool policy has changed.
+/// Default identity precedes supplemental context when there are no custom
+/// instructions. The custom prompt comes before the environment, followed by
+/// AGENTS.md, memory, TOON, plan mode, and skills when applicable.
 #[allow(clippy::too_many_arguments)]
 pub fn build_system_prompt(
     cache: &mut SystemPromptCache,
@@ -197,11 +120,12 @@ pub fn build_system_prompt_with_shell(
         plan_mode_active,
         toon_enabled,
         &ToolPolicy::Unrestricted,
+        None,
     )
 }
 
-/// Build the system prompt while keeping tool guidance consistent with the
-/// runtime authorization policy.
+/// Build the system prompt with policy-filtered skills and optional information
+/// from the host about whether the custom prompt contains actual instructions.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_system_prompt_with_shell_and_tool_policy(
     cache: &mut SystemPromptCache,
@@ -215,59 +139,61 @@ pub(crate) fn build_system_prompt_with_shell_and_tool_policy(
     plan_mode_active: bool,
     toon_enabled: bool,
     tool_policy: &ToolPolicy,
+    custom_prompt_has_instructions: Option<bool>,
 ) -> String {
     if cache.last_tool_policy != *tool_policy {
-        cache.invalidate("tool_guidance");
         cache.invalidate("skills");
         cache.last_tool_policy = tool_policy.clone();
     }
 
-    let shell_prompt = render_shell_prompt(shell);
-    if cache.last_shell_prompt.as_deref() != Some(shell_prompt.as_str()) {
-        cache.invalidate("intro");
-        cache.last_shell_prompt = Some(shell_prompt.clone());
+    let custom_prompt = custom_prompt.filter(|prompt| !prompt.trim().is_empty());
+    let has_custom_instructions = custom_prompt_has_instructions.unwrap_or(custom_prompt.is_some());
+    let fallback_model = (!has_custom_instructions).then_some(model);
+    if cache.last_fallback_model.as_deref() != fallback_model {
+        cache.invalidate("identity");
+        cache.last_fallback_model = fallback_model.map(str::to_owned);
     }
 
-    // Fast path: return cached joined result if nothing changed
+    let environment = format!(
+        "Working directory: {cwd}\n\
+         Operating system: {}\n\
+         Architecture: {}\n\
+         {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        render_shell_prompt(shell)
+    );
+
     if let Some(ref joined) = cache.joined
         && cache.last_plan_mode == plan_mode_active
         && cache.last_toon_enabled == toon_enabled
+        && cache.sections.get("environment") == Some(&environment)
+        && cache.sections.get("custom").map(String::as_str) == custom_prompt
     {
         return joined.clone();
     }
 
     let mut parts = Vec::new();
 
-    // Section: intro (session permanent)
-    let intro = cache.sections.entry("intro").or_insert_with(|| {
-        format!(
-            "You are an AI assistant that can use tools to help with tasks.\n\
-             You are powered by the model {model}.\n\
-             Working directory: {cwd}\n\
-             Current date: {}\n\
-             Operating system: {}\n\
-             Architecture: {}\n\
-             {}",
-            chrono::Local::now().format("%Y-%m-%d"),
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-            shell_prompt
-        )
-    });
-    parts.push(intro.clone());
-
-    // Section: tool guidance (session permanent)
-    let guidance = cache
-        .sections
-        .entry("tool_guidance")
-        .or_insert_with(|| tool_usage_guidance(tool_policy));
-    parts.push(guidance.clone());
-
-    // Section: custom prompt (session permanent)
-    if let Some(custom) = custom_prompt {
-        let custom_cached = cache.sections.entry("custom").or_insert_with(|| custom.to_string());
-        parts.push(custom_cached.clone());
+    if let Some(model) = fallback_model {
+        let identity = cache.sections.entry("identity").or_insert_with(|| {
+            format!(
+                "You are an AI assistant that can use tools to help with tasks.\n\
+                 You are powered by the model {model}."
+            )
+        });
+        parts.push(identity.clone());
     }
+
+    if let Some(custom) = custom_prompt {
+        cache.sections.insert("custom", custom.to_owned());
+        parts.push(custom.to_owned());
+    } else {
+        cache.sections.remove("custom");
+    }
+
+    cache.sections.insert("environment", environment.clone());
+    parts.push(environment);
 
     // Section: AGENTS.md (session permanent, hierarchical)
     let agents_section = cache.sections.entry("agents_md").or_insert_with(|| {

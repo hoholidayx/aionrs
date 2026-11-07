@@ -54,8 +54,8 @@ pub struct BootstrapResult {
 /// Encapsulates the complete initialization pipeline so all consumers
 /// (CLI, backend, sub-agents) get consistent behavior:
 ///
-/// - System prompt always includes model identity, working directory, date
-/// - Tool usage guidance is always injected
+/// - System prompt leads with custom instructions or falls back to a default identity
+/// - Workspace and shell information follow the custom prompt
 /// - AGENTS.md is loaded from the workspace hierarchy
 /// - Skills, MCP, plan mode, spawn are enabled based on `Config` fields
 pub struct AgentBootstrap {
@@ -73,6 +73,7 @@ pub struct AgentBootstrap {
     resume_session: Option<Session>,
     runtime_env: Vec<(String, String)>,
     tool_policy: ToolPolicy,
+    custom_prompt_has_instructions: Option<bool>,
 }
 
 struct BootstrapEnvironment {
@@ -111,6 +112,7 @@ impl AgentBootstrap {
             resume_session: None,
             runtime_env: Vec::new(),
             tool_policy: ToolPolicy::default(),
+            custom_prompt_has_instructions: None,
         }
     }
 
@@ -135,6 +137,13 @@ impl AgentBootstrap {
     /// Restrict which registered tools can be advertised and executed.
     pub fn tool_policy(mut self, tool_policy: ToolPolicy) -> Self {
         self.tool_policy = tool_policy;
+        self
+    }
+
+    /// Indicate whether the supplied system prompt contains custom instructions
+    /// before the host appends supplemental context such as a skills index.
+    pub fn custom_prompt_has_instructions(mut self, has_instructions: bool) -> Self {
+        self.custom_prompt_has_instructions = Some(has_instructions);
         self
     }
 
@@ -299,6 +308,7 @@ impl AgentBootstrap {
             false,
             self.config.compact.toon,
             &self.tool_policy,
+            self.custom_prompt_has_instructions,
         );
         let memory_prompt = prompt_cache.sections.get("memory").map(String::as_str);
         let skills_prompt = prompt_cache.sections.get("skills").map(String::as_str);

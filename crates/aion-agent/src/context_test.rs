@@ -61,47 +61,40 @@ mod tests {
     }
 
     #[test]
-    fn test_build_system_prompt_includes_model_name() {
-        let prompt = build_system_prompt(
-            &mut SystemPromptCache::new(),
-            None,
-            "/tmp",
-            "deepseek-chat",
-            &[],
-            None,
-            None,
-            false,
-            false,
-        );
-        assert!(
-            prompt.contains("deepseek-chat"),
-            "system prompt should contain the model name"
-        );
-        assert!(
-            prompt.contains("You are powered by the model deepseek-chat"),
-            "system prompt should contain the model identity line"
-        );
+    fn blank_custom_instructions_use_default_identity() {
+        let mut cache = SystemPromptCache::new();
+        for custom in [None, Some(" \n\t")] {
+            let prompt = build_system_prompt(&mut cache, custom, "/tmp", "test-model", &[], None, None, false, false);
+            assert!(prompt.starts_with(
+                "You are an AI assistant that can use tools to help with tasks.\nYou are powered by the model test-model.\n\nWorking directory:"
+            ));
+            assert!(!prompt.contains("Current date:"));
+            assert!(!prompt.contains("# Using your tools"));
+        }
     }
 
     #[test]
-    fn test_build_system_prompt_with_custom_instructions() {
-        // Verify that custom instructions are included in the returned prompt
+    fn custom_instructions_keep_the_same_prefix_across_workspaces() {
         let custom = "Always respond in haiku.";
-        let prompt = build_system_prompt(
-            &mut SystemPromptCache::new(),
-            Some(custom),
-            "/tmp",
-            "test-model",
-            &[],
-            None,
-            None,
-            false,
-            false,
-        );
-        assert!(
-            prompt.contains(custom),
-            "system prompt should contain the custom instructions"
-        );
+        let mut cache = SystemPromptCache::new();
+        for cwd in ["/first", "/second"] {
+            let prompt = build_system_prompt(
+                &mut cache,
+                Some(custom),
+                cwd,
+                "test-model",
+                &[],
+                None,
+                None,
+                false,
+                false,
+            );
+            assert!(prompt.starts_with(&format!("{custom}\n\nWorking directory: {cwd}\n")));
+            assert!(!prompt.contains("You are an AI assistant"));
+            assert!(!prompt.contains("You are powered by the model"));
+            assert!(!prompt.contains("Current date:"));
+            assert!(!prompt.contains("# Using your tools"));
+        }
     }
 
     #[test]
@@ -637,285 +630,34 @@ mod tests {
         assert!(!result.contains("CLAUDE.md"), "should not reference CLAUDE.md");
     }
 
-    // --- Tool usage guidance tests (task 4.3) ---
-
     #[test]
-    fn tool_guidance_section_exists() {
-        let result = build_system_prompt(
-            &mut SystemPromptCache::new(),
-            None,
-            "/tmp",
-            "test-model",
-            &[],
-            None,
-            None,
-            false,
-            false,
-        );
-        assert!(
-            result.contains("# Using your tools"),
-            "system prompt should contain the tool guidance heading"
-        );
-    }
-
-    #[test]
-    fn tool_guidance_contains_bash_prohibition_list() {
-        let result = build_system_prompt(
-            &mut SystemPromptCache::new(),
-            None,
-            "/tmp",
-            "test-model",
-            &[],
-            None,
-            None,
-            false,
-            false,
-        );
-        assert!(result.contains("Glob"), "should mention Glob as find/ls replacement");
-        assert!(result.contains("Grep"), "should mention Grep as grep/rg replacement");
-        assert!(
-            result.contains("Read"),
-            "should mention Read as cat/head/tail replacement"
-        );
-        assert!(result.contains("Edit"), "should mention Edit as sed/awk replacement");
-        assert!(
-            result.contains("Write"),
-            "should mention Write as echo/heredoc replacement"
-        );
-    }
-
-    #[test]
-    fn tool_guidance_contains_parallel_call_rules() {
-        let result = build_system_prompt(
-            &mut SystemPromptCache::new(),
-            None,
-            "/tmp",
-            "test-model",
-            &[],
-            None,
-            None,
-            false,
-            false,
-        );
-        assert!(result.contains("parallel"), "should contain parallel call guidance");
-        assert!(
-            result.contains("sequentially"),
-            "should explain when to run sequentially"
-        );
-    }
-
-    #[test]
-    fn tool_guidance_contains_edit_over_write_preference() {
-        let result = build_system_prompt(
-            &mut SystemPromptCache::new(),
-            None,
-            "/tmp",
-            "test-model",
-            &[],
-            None,
-            None,
-            false,
-            false,
-        );
-        assert!(
-            result.contains("Prefer Edit over Write"),
-            "should contain Edit-over-Write preference"
-        );
-    }
-
-    #[test]
-    fn tool_guidance_contains_read_before_edit_rule() {
-        let result = build_system_prompt(
-            &mut SystemPromptCache::new(),
-            None,
-            "/tmp",
-            "test-model",
-            &[],
-            None,
-            None,
-            false,
-            false,
-        );
-        assert!(
-            result.contains("Read a file before editing"),
-            "should contain Read-before-Edit rule"
-        );
-    }
-
-    #[test]
-    fn tool_guidance_after_intro_before_custom_prompt() {
-        let result = build_system_prompt(
-            &mut SystemPromptCache::new(),
-            Some("CUSTOM_MARKER_43"),
-            "/tmp",
-            "test-model",
-            &[],
-            None,
-            None,
-            false,
-            false,
-        );
-        let intro_pos = result.find("Working directory").unwrap();
-        let guidance_pos = result.find("# Using your tools").unwrap();
-        let custom_pos = result.find("CUSTOM_MARKER_43").unwrap();
-        assert!(guidance_pos > intro_pos, "tool guidance should appear after intro");
-        assert!(
-            guidance_pos < custom_pos,
-            "tool guidance should appear before custom prompt"
-        );
-    }
-
-    #[test]
-    fn tool_guidance_before_skills_reminder() {
-        let skills = vec![make_test_skill("guide-test-skill", "A skill", false, false)];
-        let result = build_system_prompt(
-            &mut SystemPromptCache::new(),
-            None,
-            "/tmp",
-            "test-model",
-            &skills,
-            None,
-            None,
-            false,
-            false,
-        );
-        let guidance_pos = result.find("# Using your tools").unwrap();
-        let skills_pos = result.find("guide-test-skill").unwrap();
-        assert!(
-            guidance_pos < skills_pos,
-            "tool guidance should appear before skills reminder"
-        );
-    }
-
-    #[test]
-    fn tool_guidance_present_in_plan_mode() {
-        let result = build_system_prompt(
-            &mut SystemPromptCache::new(),
-            None,
-            "/tmp",
-            "test-model",
-            &[],
-            None,
-            None,
-            true,
-            false,
-        );
-        assert!(
-            result.contains("# Using your tools"),
-            "tool guidance should be present in plan mode"
-        );
-    }
-
-    #[test]
-    fn tool_guidance_contains_deferred_instruction() {
-        let result = build_system_prompt(
-            &mut SystemPromptCache::new(),
-            None,
-            "/tmp",
-            "test-model",
-            &[],
-            None,
-            None,
-            false,
-            false,
-        );
-        assert!(
-            result.contains("deferred"),
-            "tool guidance should mention deferred tools"
-        );
-        assert!(result.contains("ToolSearch"), "tool guidance should mention ToolSearch");
-    }
-
-    #[test]
-    fn restricted_policy_only_mentions_authorized_tools() {
-        let skills = vec![make_test_skill("hidden-by-policy", "A skill", false, false)];
-        let policy = ToolPolicy::allow_only(["Read", "Grep", "Glob", "team_members"]);
-        let result = build_system_prompt_with_shell_and_tool_policy(
-            &mut SystemPromptCache::new(),
-            None,
-            "/tmp",
-            "test-model",
-            &default_shell(),
-            &skills,
-            None,
-            None,
-            false,
-            false,
-            &policy,
-        );
-
-        assert!(result.contains("File search: Glob"));
-        assert!(result.contains("Content search: Grep"));
-        assert!(result.contains("Read files: Read"));
-        for unavailable in ["ExecCommand", "Edit files", "Write files", "ToolSearch", "Skill tool"] {
-            assert!(
-                !result.contains(unavailable),
-                "restricted prompt should not mention unavailable tool guidance: {unavailable}"
-            );
-        }
-        assert!(!result.contains("hidden-by-policy"));
-    }
-
-    #[test]
-    fn changing_tool_policy_invalidates_cached_guidance() {
+    fn changing_tool_policy_refreshes_the_skill_reminder() {
         let mut cache = SystemPromptCache::new();
         let shell = default_shell();
+        let skills = vec![make_test_skill("policy-sensitive-skill", "A skill", false, false)];
         let restricted = ToolPolicy::allow_only(["Read"]);
-        let restricted_prompt = build_system_prompt_with_shell_and_tool_policy(
-            &mut cache,
-            None,
-            "/tmp",
-            "test-model",
-            &shell,
-            &[],
-            None,
-            None,
-            false,
-            false,
-            &restricted,
-        );
-        assert!(!restricted_prompt.contains("ExecCommand"));
-
-        let unrestricted_prompt = build_system_prompt_with_shell_and_tool_policy(
-            &mut cache,
-            None,
-            "/tmp",
-            "test-model",
-            &shell,
-            &[],
-            None,
-            None,
-            false,
-            false,
-            &ToolPolicy::Unrestricted,
-        );
-        assert!(unrestricted_prompt.contains("ExecCommand"));
-    }
-
-    #[test]
-    fn tool_guidance_before_memory() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mem_dir = tmp.path().join("memory");
-        std::fs::create_dir_all(&mem_dir).unwrap();
-        std::fs::write(mem_dir.join("MEMORY.md"), "- [X](x.md) \u{2014} test\n").unwrap();
-
-        let result = build_system_prompt(
-            &mut SystemPromptCache::new(),
-            None,
-            "/tmp",
-            "test-model",
-            &[],
-            None,
-            Some(&mem_dir),
-            false,
-            false,
-        );
-        let guidance_pos = result.find("# Using your tools").unwrap();
-        let memory_pos = result.find("auto memory").unwrap();
-        assert!(
-            guidance_pos < memory_pos,
-            "tool guidance should appear before memory section"
-        );
+        for (policy, skill_visible) in [
+            (&ToolPolicy::Unrestricted, true),
+            (&restricted, false),
+            (&ToolPolicy::Unrestricted, true),
+        ] {
+            let prompt = build_system_prompt_with_shell_and_tool_policy(
+                &mut cache,
+                Some("Custom instructions"),
+                "/tmp",
+                "test-model",
+                &shell,
+                &skills,
+                None,
+                None,
+                false,
+                false,
+                policy,
+                None,
+            );
+            assert_eq!(prompt.contains("policy-sensitive-skill"), skill_visible);
+            assert!(!prompt.contains("# Using your tools"));
+        }
     }
 
     // --- SystemPromptCache tests ---
