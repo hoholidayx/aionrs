@@ -8,7 +8,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::time::timeout;
 
-    async fn request_mock_response(response: String) -> McpError {
+    async fn request_mock_response(response: String, pinned: bool) -> McpError {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -17,7 +17,11 @@ mod tests {
             assert!(socket.read(&mut request).await.unwrap() > 0);
             socket.write_all(response.as_bytes()).await.unwrap();
         });
-        let transport = StreamableHttpTransport::connect(&url, &HashMap::new()).await.unwrap();
+        let transport = if pinned {
+            StreamableHttpTransport::connect_pinned(&url, &HashMap::new()).unwrap()
+        } else {
+            StreamableHttpTransport::connect(&url, &HashMap::new()).await.unwrap()
+        };
         let error = transport
             .request(&JsonRpcRequest::new(1, "tools/call", None))
             .await
@@ -44,7 +48,7 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             MAX_RESPONSE_BYTES + 1
         );
-        let error = request_mock_response(response).await;
+        let error = request_mock_response(response, false).await;
         assert!(error.to_string().contains("64 MiB limit"));
     }
 
@@ -55,9 +59,27 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{private_payload}",
             private_payload.len()
         );
-        let error = request_mock_response(response).await.to_string();
+        let error = request_mock_response(response, false).await.to_string();
         assert!(error.contains("Failed to parse MCP JSON response"));
         assert!(!error.contains(private_payload));
+    }
+
+    #[tokio::test]
+    async fn pinned_rpc_errors_keep_the_code_without_remote_payload() {
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": {"code": -32000, "message": "private-output-sentinel"},
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let pinned = request_mock_response(response.clone(), true).await;
+        assert!(matches!(pinned, McpError::JsonRpc { code: -32000, .. }));
+        assert!(!pinned.to_string().contains("private-output-sentinel"));
+        let ordinary = request_mock_response(response, false).await;
+        assert!(ordinary.to_string().contains("private-output-sentinel"));
     }
 
     #[tokio::test]

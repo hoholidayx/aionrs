@@ -13,7 +13,8 @@ use tokio::task::JoinHandle;
 use super::{McpError, McpTransport};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
 
-const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RESPONSE_MIB: usize = 64;
+const MAX_RESPONSE_BYTES: usize = MAX_RESPONSE_MIB * 1024 * 1024;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_ID: &str = "mcp-session-id";
 const PROTOCOL_VERSION: &str = "mcp-protocol-version";
@@ -209,7 +210,7 @@ impl Drop for StreamableHttpTransport {
 }
 
 fn response_size_error() -> McpError {
-    McpError::Transport("MCP HTTP response exceeds the 64 MiB limit".into())
+    McpError::Transport(format!("MCP HTTP response exceeds the {MAX_RESPONSE_MIB} MiB limit"))
 }
 
 /// Reassemble complete LF or CRLF frames without rescanning a partial line.
@@ -273,9 +274,15 @@ impl McpTransport for StreamableHttpTransport {
         let rpc_response = self.parse_response(response, request_id).await?;
 
         if let Some(err) = &rpc_response.error {
+            // Pinned endpoints handle image inputs and credentials. A remote error
+            // may echo those values, and callers log discovery failures.
             return Err(McpError::JsonRpc {
                 code: err.code,
-                message: err.message.clone(),
+                message: if self.pinned {
+                    "Remote MCP request failed".into()
+                } else {
+                    err.message.clone()
+                },
             });
         }
         if req.method == "initialize"

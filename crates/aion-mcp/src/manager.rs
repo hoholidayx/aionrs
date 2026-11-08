@@ -204,7 +204,13 @@ impl McpManager {
                 .result
                 .ok_or_else(|| McpError::InitFailed("No result in initialize response".into()))?,
         )
-        .map_err(|e| McpError::InitFailed(format!("Failed to parse init result: {}", e)))?;
+        .map_err(|error| {
+            McpError::InitFailed(if pinned {
+                "Failed to parse MCP initialize result".into()
+            } else {
+                format!("Failed to parse init result: {error}")
+            })
+        })?;
 
         // Check whether server declared resources capability
         let supports_resources = init_result
