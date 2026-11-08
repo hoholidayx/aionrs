@@ -70,6 +70,26 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn tool_discovery_rejects_repeated_cursor() {
+        let transport = MockTransport::new(vec![
+            json!({"tools": [], "nextCursor": "repeat"}),
+            json!({"tools": [], "nextCursor": "repeat"}),
+        ]);
+        let error = McpManager::discover_tools(&transport).await.unwrap_err();
+        assert!(error.to_string().contains("repeated a pagination cursor"));
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_stops_after_page_limit() {
+        let pages = (0..MAX_TOOL_PAGES)
+            .map(|index| json!({"tools": [], "nextCursor": index.to_string()}))
+            .collect();
+        let transport = MockTransport::new(pages);
+        let error = McpManager::discover_tools(&transport).await.unwrap_err();
+        assert!(error.to_string().contains("tool pages exceed"));
+    }
+
     // -----------------------------------------------------------------------
     // Test helpers: build McpManager with pre-configured servers
     // -----------------------------------------------------------------------
@@ -439,13 +459,9 @@ mod tests {
     }
 
     #[test]
-    fn tc_2_wb_next_id_starts_at_10() {
-        // [白盒] Decision 4: AtomicU64 counter starts at 10 to avoid conflict with connect_server IDs 1/2
+    fn tool_calls_start_after_reserved_discovery_ids() {
         let manager = make_manager_with_servers(vec![]);
-        // next_id is private — we verify by doing two fetch_adds and checking values are 10 and 11
-        let id1 = manager.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let id2 = manager.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(id1, 10, "first ID should be 10");
-        assert_eq!(id2, 11, "second ID should be 11");
+        let first_call = manager.next_id.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(first_call, FIRST_TOOL_PAGE_ID + MAX_TOOL_PAGES);
     }
 }

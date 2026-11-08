@@ -1,14 +1,22 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue, WWW_AUTHENTICATE};
+use reqwest::redirect::Policy;
+use reqwest::{Method, RequestBuilder, StatusCode, Url};
+use tokio::runtime::Handle;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use super::{McpError, McpTransport};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const SESSION_ID: &str = "mcp-session-id";
+const PROTOCOL_VERSION: &str = "mcp-protocol-version";
 
 /// Streamable HTTP transport: uses HTTP POST for both requests and responses
 /// Supports optional SSE streaming for server responses
@@ -16,27 +24,58 @@ pub struct StreamableHttpTransport {
     client: reqwest::Client,
     url: String,
     headers: HeaderMap,
-    session_id: Mutex<Option<String>>,
+    session: Mutex<HttpSession>,
+    pinned: bool,
     next_id: AtomicU64,
+}
+
+#[derive(Default)]
+struct HttpSession {
+    id: Option<HeaderValue>,
+    protocol_version: Option<HeaderValue>,
 }
 
 impl StreamableHttpTransport {
     /// Create a new Streamable HTTP transport
     pub async fn connect(url: &str, headers: &HashMap<String, String>) -> Result<Self, McpError> {
+        Self::new(url, headers, reqwest::Client::new(), false)
+    }
+
+    pub(crate) fn connect_pinned(url: &str, headers: &HashMap<String, String>) -> Result<Self, McpError> {
+        let endpoint = Url::parse(url).map_err(|_| McpError::InitFailed("Invalid MCP HTTP endpoint".into()))?;
+        if !matches!(endpoint.scheme(), "http" | "https") {
+            return Err(McpError::InitFailed("Invalid MCP HTTP endpoint scheme".into()));
+        }
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .build()
+            .map_err(|_| McpError::InitFailed("Failed to create pinned MCP HTTP client".into()))?;
+        Self::new(endpoint.as_str(), headers, client, true)
+    }
+
+    fn new(
+        url: &str,
+        headers: &HashMap<String, String>,
+        client: reqwest::Client,
+        pinned: bool,
+    ) -> Result<Self, McpError> {
         let mut header_map = HeaderMap::new();
         for (k, v) in headers {
             let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
                 .map_err(|e| McpError::Transport(format!("Invalid header name '{}': {}", k, e)))?;
             let value =
                 HeaderValue::from_str(v).map_err(|_| McpError::Transport(format!("Invalid value for header '{k}'")))?;
-            header_map.insert(name, value);
+            if !pinned || !matches!(name.as_str(), SESSION_ID | PROTOCOL_VERSION) {
+                header_map.insert(name, value);
+            }
         }
 
         Ok(Self {
-            client: reqwest::Client::new(),
+            client,
             url: url.to_string(),
             headers: header_map,
-            session_id: Mutex::new(None),
+            session: Mutex::new(HttpSession::default()),
+            pinned,
             next_id: AtomicU64::new(1),
         })
     }
@@ -46,19 +85,45 @@ impl StreamableHttpTransport {
     }
 
     /// Build request with session ID header if available
-    async fn build_request(&self, body: String) -> reqwest::RequestBuilder {
-        let mut req = self
-            .client
-            .post(&self.url)
-            .headers(self.headers.clone())
+    async fn build_request(&self, body: String) -> RequestBuilder {
+        let session = self.session.lock().await;
+        self.request_builder(Method::POST, &session)
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream");
+            .header("Accept", "application/json, text/event-stream")
+            .body(body)
+    }
 
-        if let Some(sid) = self.session_id.lock().await.as_ref() {
-            req = req.header("Mcp-Session-Id", sid.as_str());
+    fn request_builder(&self, method: Method, session: &HttpSession) -> RequestBuilder {
+        let mut headers = self.headers.clone();
+        if let Some(id) = &session.id {
+            headers.insert(SESSION_ID, id.clone());
         }
+        if let Some(version) = &session.protocol_version {
+            headers.insert(PROTOCOL_VERSION, version.clone());
+        }
+        self.client.request(method, &self.url).headers(headers)
+    }
 
-        req.body(body)
+    fn begin_close(&self, session: HttpSession) -> Option<JoinHandle<Result<(), McpError>>> {
+        session.id.as_ref()?;
+        let runtime = Handle::try_current().ok()?;
+        let request = self.request_builder(Method::DELETE, &session).timeout(CLOSE_TIMEOUT);
+        // Own the bounded request so cancellation of the caller does not lose the session ID.
+        Some(runtime.spawn(close_session(request)))
+    }
+
+    fn status_error(&self, response: &reqwest::Response) -> McpError {
+        if self.pinned {
+            return McpError::HttpStatus {
+                status: response.status().as_u16(),
+                www_authenticate: response
+                    .headers()
+                    .get(WWW_AUTHENTICATE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+            };
+        }
+        McpError::Transport(format!("HTTP request returned status: {}", response.status()))
     }
 
     /// Parse a bounded response without embedding remote payloads in errors.
@@ -67,10 +132,8 @@ impl StreamableHttpTransport {
         mut response: reqwest::Response,
         request_id: u64,
     ) -> Result<JsonRpcResponse, McpError> {
-        if let Some(sid) = response.headers().get("mcp-session-id")
-            && let Ok(sid_str) = sid.to_str()
-        {
-            *self.session_id.lock().await = Some(sid_str.to_string());
+        if let Some(id) = response.headers().get(SESSION_ID) {
+            self.session.lock().await.id = Some(id.clone());
         }
 
         let is_sse = response
@@ -116,6 +179,27 @@ impl StreamableHttpTransport {
             return Err(McpError::Transport("MCP response has an unexpected request ID".into()));
         }
         Ok(response)
+    }
+}
+
+async fn close_session(request: RequestBuilder) -> Result<(), McpError> {
+    let response = request
+        .send()
+        .await
+        .map_err(|e| McpError::Transport(format!("MCP session close failed: {}", e.without_url())))?;
+    let status = response.status();
+    if status.is_success() || matches!(status, StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED) {
+        return Ok(());
+    }
+    Err(McpError::Transport(format!(
+        "MCP session close returned status: {status}"
+    )))
+}
+
+impl Drop for StreamableHttpTransport {
+    fn drop(&mut self) {
+        let session = std::mem::take(self.session.get_mut());
+        drop(self.begin_close(session));
     }
 }
 
@@ -178,10 +262,7 @@ impl McpTransport for StreamableHttpTransport {
             .map_err(|e| McpError::Transport(format!("HTTP request failed: {}", e.without_url())))?;
 
         if !response.status().is_success() {
-            return Err(McpError::Transport(format!(
-                "HTTP request returned status: {}",
-                response.status()
-            )));
+            return Err(self.status_error(&response));
         }
 
         let rpc_response = self.parse_response(response, request_id).await?;
@@ -192,6 +273,16 @@ impl McpTransport for StreamableHttpTransport {
                 message: err.message.clone(),
             });
         }
+        if req.method == "initialize"
+            && let Some(version) = rpc_response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("protocolVersion"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|version| HeaderValue::from_str(version).ok())
+        {
+            self.session.lock().await.protocol_version = Some(version);
+        }
 
         Ok(rpc_response)
     }
@@ -201,17 +292,25 @@ impl McpTransport for StreamableHttpTransport {
             serde_json::to_string(req).map_err(|e| McpError::Transport(format!("JSON serialize error: {}", e)))?;
 
         let http_req = self.build_request(body).await;
-        http_req
+        let response = http_req
             .send()
             .await
             .map_err(|e| McpError::Transport(format!("Notification request failed: {}", e.without_url())))?;
+        if self.pinned && !response.status().is_success() {
+            return Err(self.status_error(&response));
+        }
 
         Ok(())
     }
 
     async fn close(&self) -> Result<(), McpError> {
-        // No persistent connection to close for HTTP
-        Ok(())
+        let session = std::mem::take(&mut *self.session.lock().await);
+        match self.begin_close(session) {
+            Some(close) => close
+                .await
+                .map_err(|_| McpError::Transport("MCP session close task failed".into()))?,
+            None => Ok(()),
+        }
     }
 }
 

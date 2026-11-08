@@ -3,8 +3,10 @@ use super::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::time::timeout;
 
     async fn request_mock_response(response: String) -> McpError {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -44,6 +46,66 @@ mod tests {
         let error = request_mock_response(response).await.to_string();
         assert!(error.contains("Failed to parse MCP JSON response"));
         assert!(!error.contains(private_payload));
+    }
+
+    #[tokio::test]
+    async fn pinned_calls_do_not_forward_tool_body_or_credentials_on_redirect() {
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", origin.local_addr().unwrap());
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{}/other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            target.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = origin.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(redirect.as_bytes()).await.unwrap();
+        });
+        let headers = HashMap::from([("X-Api-Key".into(), "synthetic-credential".into())]);
+        let transport = StreamableHttpTransport::connect_pinned(&url, &headers).unwrap();
+        let request = JsonRpcRequest::new(1, "tools/call", Some(json!({"images": ["synthetic-image"]})));
+        let error = timeout(Duration::from_secs(2), transport.request(&request))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, McpError::HttpStatus { status: 307, .. }));
+        server.await.unwrap();
+        assert!(timeout(Duration::from_millis(100), target.accept()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn abandoned_stateful_transport_closes_the_server_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nMcp-Session-Id: synthetic-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let bytes = socket.read(&mut request).await.unwrap();
+            let headers = String::from_utf8_lossy(&request[..bytes]).to_ascii_lowercase();
+            assert!(headers.starts_with("delete /mcp "));
+            assert!(headers.contains("mcp-session-id: synthetic-session"));
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let transport = StreamableHttpTransport::connect_pinned(&url, &HashMap::new()).unwrap();
+        transport
+            .request(&JsonRpcRequest::new(1, "initialize", None))
+            .await
+            .unwrap();
+        drop(transport);
+        timeout(Duration::from_secs(3), server).await.unwrap().unwrap();
     }
 
     /// Servers built on the MCP Python SDK / `fastmcp` use `sse-starlette`,

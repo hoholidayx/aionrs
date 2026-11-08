@@ -77,6 +77,7 @@ pub struct AgentBootstrap {
     custom_prompt_has_instructions: Option<bool>,
     host_tools: Vec<Box<dyn Tool>>,
     excluded_mcp_tools: HashMap<String, HashSet<String>>,
+    pinned_mcp_http_servers: HashSet<String>,
 }
 
 struct BootstrapEnvironment {
@@ -118,6 +119,7 @@ impl AgentBootstrap {
             custom_prompt_has_instructions: None,
             host_tools: Vec::new(),
             excluded_mcp_tools: HashMap::new(),
+            pinned_mcp_http_servers: HashSet::new(),
         }
     }
 
@@ -154,6 +156,12 @@ impl AgentBootstrap {
     /// Keep upstream tools under host control by excluding their model-facing proxies.
     pub fn exclude_mcp_tools(mut self, excluded: HashMap<String, HashSet<String>>) -> Self {
         self.excluded_mcp_tools = excluded;
+        self
+    }
+
+    /// Disable redirects for these configured Streamable HTTP servers.
+    pub fn pin_mcp_http_servers(mut self, servers: HashSet<String>) -> Self {
+        self.pinned_mcp_http_servers = servers;
         self
     }
 
@@ -281,13 +289,14 @@ impl AgentBootstrap {
             return McpBootstrap::default();
         }
 
-        let manager = match McpManager::connect_all(&server_configs).await {
-            Ok(manager) => Arc::new(manager),
-            Err(err) => {
-                self.output.emit_error(&format!("MCP initialization error: {err}"));
-                return McpBootstrap::default();
-            }
-        };
+        let manager =
+            match McpManager::connect_all_with_pinned_http(&server_configs, &self.pinned_mcp_http_servers).await {
+                Ok(manager) => Arc::new(manager),
+                Err(err) => {
+                    self.output.emit_error(&format!("MCP initialization error: {err}"));
+                    return McpBootstrap::default();
+                }
+            };
 
         register_mcp_tools_filtered(
             registry,

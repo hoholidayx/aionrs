@@ -21,6 +21,12 @@ pub enum McpError {
     #[error("Transport error: {0}")]
     Transport(String),
 
+    #[error("MCP HTTP request returned status {status}")]
+    HttpStatus {
+        status: u16,
+        www_authenticate: Option<String>,
+    },
+
     #[error("JSON-RPC error {code}: {message}")]
     JsonRpc { code: i64, message: String },
 

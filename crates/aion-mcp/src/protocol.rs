@@ -126,6 +126,8 @@ pub struct InitializeResult {
 #[derive(Debug, Deserialize)]
 pub struct ToolsListResult {
     pub tools: Vec<McpToolDef>,
+    #[serde(rename = "nextCursor", default)]
+    pub(crate) next_cursor: Option<String>,
 }
 
 /// MCP resource definition returned by resources/list

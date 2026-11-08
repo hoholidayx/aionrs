@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -18,6 +18,10 @@ use super::transport::{McpError, McpTransport};
 
 const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 30_000;
 const STRUCTURED_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TOOL_PAGES: u64 = 64;
+const MAX_DISCOVERED_TOOLS: usize = 10_000;
+const FIRST_TOOL_PAGE_ID: u64 = 2;
+const FIRST_CALL_ID: u64 = FIRST_TOOL_PAGE_ID + MAX_TOOL_PAGES;
 
 /// A connected MCP server with its discovered tools and capabilities
 struct McpServer {
@@ -39,10 +43,28 @@ pub struct McpManager {
 impl McpManager {
     /// Connect to all configured MCP servers
     pub async fn connect_all(configs: &HashMap<String, McpServerConfig>) -> Result<Self, McpError> {
-        Self::connect_all_with_connector(configs, |name, config| async move {
-            Self::connect_server(&name, &config).await
+        Self::connect_all_with_pinned_http(configs, &HashSet::new()).await
+    }
+
+    /// Connect to all configured servers, disabling redirects for the named Streamable HTTP endpoints.
+    pub async fn connect_all_with_pinned_http(
+        configs: &HashMap<String, McpServerConfig>,
+        pinned: &HashSet<String>,
+    ) -> Result<Self, McpError> {
+        Self::connect_all_with_connector(configs, |name, config| {
+            let pinned = pinned.contains(&name);
+            async move { Self::connect_server(&name, &config, pinned).await }
         })
         .await
+    }
+
+    /// Connect to a single configured Streamable HTTP endpoint without following redirects.
+    pub async fn connect_pinned_http(name: &str, config: &McpServerConfig) -> Result<Self, McpError> {
+        let server = Self::with_startup_timeout(name, config, Self::connect_server(name, config, true)).await?;
+        Ok(Self {
+            servers: HashMap::from([(name.to_owned(), server)]),
+            next_id: AtomicU64::new(FIRST_CALL_ID),
+        })
     }
 
     async fn connect_all_with_connector<F, Fut>(
@@ -81,7 +103,7 @@ impl McpManager {
 
         Ok(Self {
             servers,
-            next_id: AtomicU64::new(10),
+            next_id: AtomicU64::new(FIRST_CALL_ID),
         })
     }
 
@@ -110,7 +132,7 @@ impl McpManager {
     /// Connect a single additional MCP server after initial setup.
     /// Returns the list of tool names exposed by the server.
     pub async fn connect_one(&mut self, name: String, config: &McpServerConfig) -> Result<Vec<String>, McpError> {
-        let server = Self::with_startup_timeout(&name, config, Self::connect_server(&name, config)).await?;
+        let server = Self::with_startup_timeout(&name, config, Self::connect_server(&name, config, false)).await?;
         let tool_names: Vec<String> = server.tools.iter().map(|t| t.name.clone()).collect();
         tracing::info!(target: "aion_mcp", server = %name, tools = server.tools.len(), resources = server.supports_resources, "mcp server connected");
         self.servers.insert(name, server);
@@ -118,7 +140,10 @@ impl McpManager {
     }
 
     /// Connect to a single MCP server: create transport, initialize, discover tools
-    async fn connect_server(name: &str, config: &McpServerConfig) -> Result<McpServer, McpError> {
+    async fn connect_server(name: &str, config: &McpServerConfig, pinned: bool) -> Result<McpServer, McpError> {
+        if pinned && !matches!(config.transport, TransportType::StreamableHttp) {
+            return Err(McpError::InitFailed("Pinned endpoint requires Streamable HTTP".into()));
+        }
         let empty_map = HashMap::new();
 
         // 1. Create transport
@@ -146,7 +171,11 @@ impl McpManager {
                     .as_deref()
                     .ok_or_else(|| McpError::InitFailed("streamable-http transport requires 'url'".into()))?;
                 let headers = config.headers.as_ref().unwrap_or(&empty_map);
-                Box::new(StreamableHttpTransport::connect(url, headers).await?)
+                if pinned {
+                    Box::new(StreamableHttpTransport::connect_pinned(url, headers)?)
+                } else {
+                    Box::new(StreamableHttpTransport::connect(url, headers).await?)
+                }
             }
         };
 
@@ -188,22 +217,46 @@ impl McpManager {
         let initialized_notification = JsonRpcRequest::notification("notifications/initialized", None);
         transport.notify(&initialized_notification).await?;
 
-        // 4. List tools
-        let list_req = JsonRpcRequest::new(2, "tools/list", None);
-        let list_response = transport.request(&list_req).await?;
-        let tools_result: ToolsListResult = serde_json::from_value(
-            list_response
-                .result
-                .ok_or_else(|| McpError::InitFailed("No result in tools/list response".into()))?,
-        )
-        .map_err(|e| McpError::InitFailed(format!("Failed to parse tools list: {}", e)))?;
+        let tools = Self::discover_tools(transport.as_ref()).await?;
 
         Ok(McpServer {
             name: name.to_string(),
             transport,
-            tools: tools_result.tools,
+            tools,
             supports_resources,
         })
+    }
+
+    async fn discover_tools(transport: &dyn McpTransport) -> Result<Vec<McpToolDef>, McpError> {
+        let mut tools = Vec::new();
+        let mut cursors = HashSet::new();
+        let mut params = None;
+        for id in FIRST_TOOL_PAGE_ID..FIRST_CALL_ID {
+            let request = JsonRpcRequest::new(id, "tools/list", params);
+            let response = transport.request(&request).await?;
+            let page: ToolsListResult = serde_json::from_value(
+                response
+                    .result
+                    .ok_or_else(|| McpError::InitFailed("No result in tools/list response".into()))?,
+            )
+            .map_err(|_| McpError::InitFailed("Failed to parse tools list".into()))?;
+            if tools.len() + page.tools.len() > MAX_DISCOVERED_TOOLS {
+                return Err(McpError::InitFailed(
+                    "MCP tool count exceeds the discovery limit".into(),
+                ));
+            }
+            tools.extend(page.tools);
+            let Some(cursor) = page.next_cursor else {
+                return Ok(tools);
+            };
+            if !cursors.insert(cursor.clone()) {
+                return Err(McpError::InitFailed(
+                    "MCP tools/list repeated a pagination cursor".into(),
+                ));
+            }
+            params = Some(json!({ "cursor": cursor }));
+        }
+        Err(McpError::InitFailed("MCP tool pages exceed the discovery limit".into()))
     }
 
     /// Get all discovered tools with their server names
@@ -383,7 +436,7 @@ impl McpManager {
         }
         Self {
             servers,
-            next_id: AtomicU64::new(10),
+            next_id: AtomicU64::new(FIRST_CALL_ID),
         }
     }
 }
