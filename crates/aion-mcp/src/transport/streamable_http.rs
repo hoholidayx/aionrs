@@ -105,6 +105,11 @@ impl StreamableHttpTransport {
     }
 
     fn begin_close(&self, session: HttpSession) -> Option<JoinHandle<Result<(), McpError>>> {
+        // Session termination sends credentials and the negotiated session ID.
+        // Only the pinned client guarantees DELETE stays on this endpoint.
+        if !self.pinned {
+            return None;
+        }
         session.id.as_ref()?;
         let runtime = Handle::try_current().ok()?;
         let request = self.request_builder(Method::DELETE, &session).timeout(CLOSE_TIMEOUT);

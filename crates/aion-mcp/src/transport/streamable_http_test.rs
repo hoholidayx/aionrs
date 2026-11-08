@@ -26,6 +26,18 @@ mod tests {
         error
     }
 
+    async fn accept_stateful_initialize(listener: &TcpListener) {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nMcp-Session-Id: synthetic-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 1024];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
     #[tokio::test]
     async fn rejects_oversized_response_before_reading_body() {
         let response = format!(
@@ -80,15 +92,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nMcp-Session-Id: synthetic-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let (mut socket, _) = listener.accept().await.unwrap();
+            accept_stateful_initialize(&listener).await;
             let mut request = [0u8; 1024];
-            assert!(socket.read(&mut request).await.unwrap() > 0);
-            socket.write_all(response.as_bytes()).await.unwrap();
             let (mut socket, _) = listener.accept().await.unwrap();
             let bytes = socket.read(&mut request).await.unwrap();
             let headers = String::from_utf8_lossy(&request[..bytes]).to_ascii_lowercase();
@@ -106,6 +111,29 @@ mod tests {
             .unwrap();
         drop(transport);
         timeout(Duration::from_secs(3), server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_stateful_transport_does_not_send_a_session_delete() {
+        for close_explicitly in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                accept_stateful_initialize(&listener).await;
+                listener
+            });
+            let transport = StreamableHttpTransport::connect(&url, &HashMap::new()).await.unwrap();
+            transport
+                .request(&JsonRpcRequest::new(1, "initialize", None))
+                .await
+                .unwrap();
+            let listener = server.await.unwrap();
+            if close_explicitly {
+                transport.close().await.unwrap();
+            }
+            drop(transport);
+            assert!(timeout(Duration::from_millis(100), listener.accept()).await.is_err());
+        }
     }
 
     /// Servers built on the MCP Python SDK / `fastmcp` use `sse-starlette`,
