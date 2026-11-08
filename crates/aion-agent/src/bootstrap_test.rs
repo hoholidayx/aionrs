@@ -159,4 +159,19 @@ mod tests {
         assert!(denied.content.starts_with("No deferred tools matching"));
         assert!(!denied.content.contains("\"name\": \"DeniedDeferred\""));
     }
+
+    #[tokio::test]
+    async fn bootstrap_registers_embedding_host_tool() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut config = test_config();
+        config.mcp.servers.clear();
+        let result = AgentBootstrap::new(config, workspace.path().to_string_lossy(), Arc::new(NullSink))
+            .isolated_skill_dirs(vec![workspace.path().to_path_buf()])
+            .host_tool(Box::new(DeferredTestTool("ExampleHostTool")))
+            .build()
+            .await
+            .unwrap();
+
+        assert!(result.engine.tool_names().iter().any(|name| name == "ExampleHostTool"));
+    }
 }

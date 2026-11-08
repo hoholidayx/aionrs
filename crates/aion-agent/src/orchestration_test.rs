@@ -235,6 +235,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_single_passes_the_engine_call_id_to_host_tool() {
+        use aion_protocol::events::ToolCategory;
+        use aion_tools::ToolExecutionOutput;
+        use aion_types::tool::ToolResult;
+        use serde_json::Value;
+
+        struct HostTool;
+
+        #[async_trait::async_trait]
+        impl Tool for HostTool {
+            fn name(&self) -> &str {
+                "HostTool"
+            }
+            fn description(&self) -> &str {
+                "Test host callback"
+            }
+            fn input_schema(&self) -> Value {
+                json!({"type": "object"})
+            }
+            fn is_concurrency_safe(&self, _input: &Value) -> bool {
+                true
+            }
+            async fn execute(&self, _input: Value) -> ToolResult {
+                panic!("the host callback needs its engine call ID");
+            }
+            async fn execute_with_call_id(&self, _input: Value, call_id: &str) -> ToolExecutionOutput {
+                ToolResult {
+                    content: call_id.into(),
+                    is_error: false,
+                }
+                .into()
+            }
+            fn category(&self) -> ToolCategory {
+                ToolCategory::Mcp
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(HostTool));
+        let call = ContentBlock::ToolUse {
+            id: "host-call-42".into(),
+            name: "HostTool".into(),
+            input: json!({}),
+            extra: None,
+        };
+        let (result, _, blocks) =
+            execute_single(&registry, &call, None, aion_compact::CompactLevel::Off, false, 10_000).await;
+        assert!(matches!(
+            result,
+            ContentBlock::ToolResult { tool_use_id, content, is_error: false }
+                if tool_use_id == "host-call-42" && content == tool_use_id
+        ));
+        assert!(blocks.is_empty());
+    }
+
+    #[tokio::test]
     async fn execute_single_deferred_tool_error_missing_required_appends_hint() {
         let registry = make_registry_with_deferred();
         let call = ContentBlock::ToolUse {

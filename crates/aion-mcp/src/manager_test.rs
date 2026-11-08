@@ -78,6 +78,70 @@ mod tests {
         McpManager::new_for_test(entries)
     }
 
+    #[tokio::test]
+    async fn structured_tool_call_keeps_image_metadata_and_error_flag() {
+        let result = json!({
+            "content": [{"type": "image", "mimeType": "image/png", "data": "cG5n"}],
+            "structuredContent": {"status": "failed"},
+            "isError": true
+        });
+        let manager = make_manager_with_servers(vec![(
+            "image",
+            false,
+            Box::new(MockTransport::new(vec![result.clone(), result])),
+        )]);
+        let structured = manager.call_tool_structured("image", "get", json!({})).await.unwrap();
+        assert!(structured.is_error);
+        assert_eq!(structured.structured_content, Some(json!({"status": "failed"})));
+        assert!(matches!(
+            &structured.content[..],
+            [McpContent::Image { data, mime_type }] if data == "cG5n" && mime_type == "image/png"
+        ));
+        assert_eq!(
+            manager.call_tool("image", "get", json!({})).await.unwrap(),
+            "[image: image/png]"
+        );
+    }
+
+    #[test]
+    fn host_managed_tool_filter_keeps_other_proxies_and_reserves_host_name() {
+        use crate::tool_proxy::register_mcp_tools_filtered;
+        use aion_tools::registry::ToolRegistry;
+        use std::collections::HashSet;
+
+        let mut manager = make_manager_with_servers(vec![
+            ("selected", false, Box::new(MockTransport::new(vec![]))),
+            ("ordinary", false, Box::new(MockTransport::new(vec![]))),
+        ]);
+        let tool = |name: &str| McpToolDef {
+            name: name.into(),
+            description: None,
+            input_schema: json!({"type":"object"}),
+        };
+        manager.servers.get_mut("selected").unwrap().tools =
+            vec![tool("private_submit"), tool("private_status"), tool("other")];
+        manager.servers.get_mut("ordinary").unwrap().tools = vec![tool("private_submit"), tool("host_tool")];
+        let mut registry = ToolRegistry::new();
+        register_mcp_tools_filtered(
+            &mut registry,
+            &Arc::new(manager),
+            &["host_tool".into()],
+            &HashMap::new(),
+            &HashMap::from([(
+                "selected".into(),
+                HashSet::from(["private_submit".into(), "private_status".into()]),
+            )]),
+        );
+        assert_eq!(
+            registry.tool_names().into_iter().collect::<HashSet<_>>(),
+            HashSet::from([
+                "other".into(),
+                "private_submit".into(),
+                "mcp__ordinary_host_tool".into()
+            ]),
+        );
+    }
+
     fn delayed_config(delay_ms: u64, startup_timeout_ms: Option<u64>) -> McpServerConfig {
         McpServerConfig {
             transport: TransportType::Stdio,

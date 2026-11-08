@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -113,7 +113,27 @@ pub fn register_mcp_tools(
     builtin_names: &[String],
     server_configs: &HashMap<String, McpServerConfig>,
 ) {
-    let all_tools = manager.all_tools();
+    register_mcp_tools_filtered(registry, manager, builtin_names, server_configs, &HashMap::new());
+}
+
+/// Register model-facing proxies, leaving the selected upstream tools to the host.
+/// Exclusions are keyed by configured server name and original tool name.
+pub fn register_mcp_tools_filtered(
+    registry: &mut aion_tools::registry::ToolRegistry,
+    manager: &Arc<McpManager>,
+    builtin_names: &[String],
+    server_configs: &HashMap<String, McpServerConfig>,
+    excluded: &HashMap<String, HashSet<String>>,
+) {
+    let all_tools: Vec<_> = manager
+        .all_tools()
+        .into_iter()
+        .filter(|(server, tool)| !excluded.get(*server).is_some_and(|names| names.contains(&tool.name)))
+        .collect();
+    let mut name_counts = HashMap::new();
+    for (_, tool) in &all_tools {
+        *name_counts.entry(tool.name.as_str()).or_insert(0usize) += 1;
+    }
 
     // Determine which names need prefixing
     for (server_name, tool_def) in &all_tools {
@@ -123,7 +143,7 @@ pub fn register_mcp_tools(
         let collides_builtin = builtin_names.iter().any(|n| n == original_name);
 
         // Check collision with other MCP servers' tools
-        let cross_server_collision = manager.tool_name_count(original_name) > 1;
+        let cross_server_collision = name_counts[original_name.as_str()] > 1;
 
         let display_name = if collides_builtin || cross_server_collision {
             format!("mcp__{}_{}", server_name, original_name)

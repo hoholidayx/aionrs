@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
@@ -6,12 +6,13 @@ use std::sync::{Arc, RwLock};
 use aion_config::config::{Config, McpServerConfig};
 use aion_config::shell::{ResolvedShell, resolve_shell_config};
 use aion_mcp::manager::McpManager;
-use aion_mcp::tool_proxy::register_mcp_tools;
+use aion_mcp::tool_proxy::register_mcp_tools_filtered;
 use aion_memory::paths::ENTRYPOINT_NAME;
 use aion_providers::{LlmProvider, create_provider};
 use aion_skills::loader::load_all_skills;
 use aion_skills::permissions::SkillPermissionChecker;
 use aion_skills::types::SkillMetadata;
+use aion_tools::Tool;
 use aion_tools::edit::EditTool;
 use aion_tools::exec_command::ExecCommandTool;
 use aion_tools::file_cache::FileStateCache;
@@ -74,6 +75,8 @@ pub struct AgentBootstrap {
     runtime_env: Vec<(String, String)>,
     tool_policy: ToolPolicy,
     custom_prompt_has_instructions: Option<bool>,
+    host_tools: Vec<Box<dyn Tool>>,
+    excluded_mcp_tools: HashMap<String, HashSet<String>>,
 }
 
 struct BootstrapEnvironment {
@@ -113,6 +116,8 @@ impl AgentBootstrap {
             runtime_env: Vec::new(),
             tool_policy: ToolPolicy::default(),
             custom_prompt_has_instructions: None,
+            host_tools: Vec::new(),
+            excluded_mcp_tools: HashMap::new(),
         }
     }
 
@@ -137,6 +142,18 @@ impl AgentBootstrap {
     /// Restrict which registered tools can be advertised and executed.
     pub fn tool_policy(mut self, tool_policy: ToolPolicy) -> Self {
         self.tool_policy = tool_policy;
+        self
+    }
+
+    /// Register a tool supplied by the embedding host before MCP discovery and ToolSearch.
+    pub fn host_tool(mut self, tool: Box<dyn Tool>) -> Self {
+        self.host_tools.push(tool);
+        self
+    }
+
+    /// Keep upstream tools under host control by excluding their model-facing proxies.
+    pub fn exclude_mcp_tools(mut self, excluded: HashMap<String, HashSet<String>>) -> Self {
+        self.excluded_mcp_tools = excluded;
         self
     }
 
@@ -174,6 +191,14 @@ impl AgentBootstrap {
         let provider = self.resolve_provider();
         let environment = self.resolve_environment(workspace)?;
         let mut registry = self.build_builtin_registry(&environment.workspace);
+        for tool in self.host_tools.drain(..) {
+            anyhow::ensure!(
+                registry.get(tool.name()).is_none(),
+                "Duplicate host tool name: {}",
+                tool.name()
+            );
+            registry.register(tool);
+        }
 
         let builtin_names = registry.tool_names();
         let mcp = self.connect_mcp(&mut registry, &builtin_names).await;
@@ -264,7 +289,13 @@ impl AgentBootstrap {
             }
         };
 
-        register_mcp_tools(registry, &manager, builtin_names, &server_configs);
+        register_mcp_tools_filtered(
+            registry,
+            &manager,
+            builtin_names,
+            &server_configs,
+            &self.excluded_mcp_tools,
+        );
 
         McpBootstrap {
             manager: Some(Arc::clone(&manager)),

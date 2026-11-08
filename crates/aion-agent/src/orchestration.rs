@@ -215,7 +215,7 @@ async fn execute_single(
     let (result, modifier, follow_up_blocks) = match registry.get(name) {
         Some(tool) => {
             let max_size = tool.max_result_size();
-            let execution = tool.execute_with_follow_up(input.clone()).await;
+            let execution = tool.execute_with_call_id(input.clone(), id).await;
             let r = execution.result;
             let modifier = if r.is_error {
                 None

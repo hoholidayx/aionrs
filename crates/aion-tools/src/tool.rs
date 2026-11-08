@@ -66,6 +66,11 @@ pub trait Tool: Send + Sync {
         self.execute(input).await.into()
     }
 
+    /// Execute a tool with the engine's call ID available for host-side correlation.
+    async fn execute_with_call_id(&self, input: Value, _call_id: &str) -> ToolExecutionOutput {
+        self.execute_with_follow_up(input).await
+    }
+
     /// Whether advertising and executing this tool requires image-input
     /// support from the currently selected model.
     fn requires_image_input(&self) -> bool {

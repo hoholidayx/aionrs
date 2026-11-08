@@ -8,6 +8,8 @@ use tokio::sync::Mutex;
 use super::{McpError, McpTransport};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
 
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Streamable HTTP transport: uses HTTP POST for both requests and responses
 /// Supports optional SSE streaming for server responses
 pub struct StreamableHttpTransport {
@@ -25,8 +27,8 @@ impl StreamableHttpTransport {
         for (k, v) in headers {
             let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
                 .map_err(|e| McpError::Transport(format!("Invalid header name '{}': {}", k, e)))?;
-            let value = HeaderValue::from_str(v)
-                .map_err(|e| McpError::Transport(format!("Invalid header value '{}': {}", v, e)))?;
+            let value =
+                HeaderValue::from_str(v).map_err(|_| McpError::Transport(format!("Invalid value for header '{k}'")))?;
             header_map.insert(name, value);
         }
 
@@ -44,7 +46,7 @@ impl StreamableHttpTransport {
     }
 
     /// Build request with session ID header if available
-    async fn build_request(&self, body: &str) -> reqwest::RequestBuilder {
+    async fn build_request(&self, body: String) -> reqwest::RequestBuilder {
         let mut req = self
             .client
             .post(&self.url)
@@ -56,100 +58,124 @@ impl StreamableHttpTransport {
             req = req.header("Mcp-Session-Id", sid.as_str());
         }
 
-        req.body(body.to_string())
+        req.body(body)
     }
 
-    /// Parse response based on content type
-    async fn parse_response(&self, response: reqwest::Response) -> Result<JsonRpcResponse, McpError> {
-        // Capture session ID from response headers
+    /// Parse a bounded response without embedding remote payloads in errors.
+    async fn parse_response(
+        &self,
+        mut response: reqwest::Response,
+        request_id: u64,
+    ) -> Result<JsonRpcResponse, McpError> {
         if let Some(sid) = response.headers().get("mcp-session-id")
             && let Ok(sid_str) = sid.to_str()
         {
             *self.session_id.lock().await = Some(sid_str.to_string());
         }
 
-        let content_type = response
+        let is_sse = response
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+            .is_some_and(|value| value.contains("text/event-stream"));
 
-        if content_type.contains("text/event-stream") {
-            // SSE response: parse events to find the JSON-RPC response
-            self.parse_sse_response(response).await
-        } else {
-            // Direct JSON response
-            let text = response
-                .text()
-                .await
-                .map_err(|e| McpError::Transport(format!("Read response body failed: {}", e)))?;
-            serde_json::from_str(&text)
-                .map_err(|e| McpError::Transport(format!("Parse JSON response failed: {} — raw: {}", e, text)))
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(response_size_error());
         }
-    }
 
-    /// Parse an SSE stream response to extract JSON-RPC response
-    async fn parse_sse_response(&self, response: reqwest::Response) -> Result<JsonRpcResponse, McpError> {
-        use futures::StreamExt;
-
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| McpError::Transport(format!("SSE read error: {}", e)))?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            if let Some(rpc_response) = extract_jsonrpc_from_sse_buffer(&buffer) {
-                return Ok(rpc_response);
+        let mut bytes_read = 0usize;
+        let mut body = Vec::new();
+        let mut sse = SseResponse::default();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| McpError::Transport(format!("Read response body failed: {}", e.without_url())))?
+        {
+            bytes_read = bytes_read.saturating_add(chunk.len());
+            if bytes_read > MAX_RESPONSE_BYTES {
+                return Err(response_size_error());
+            }
+            if is_sse {
+                if let Some(rpc_response) = sse.push(&chunk, request_id) {
+                    return Ok(rpc_response);
+                }
+            } else {
+                body.extend_from_slice(&chunk);
             }
         }
 
-        Err(McpError::Transport("SSE stream ended without JSON-RPC response".into()))
+        if is_sse {
+            return Err(McpError::Transport("SSE stream ended without JSON-RPC response".into()));
+        }
+        let response: JsonRpcResponse = serde_json::from_slice(&body)
+            .map_err(|_| McpError::Transport("Failed to parse MCP JSON response".into()))?;
+        if response.id != Some(request_id) {
+            return Err(McpError::Transport("MCP response has an unexpected request ID".into()));
+        }
+        Ok(response)
     }
 }
 
-/// Extract the first complete JSON-RPC response from an accumulated SSE buffer.
-///
-/// Tolerant of both LF (`\n`) and CRLF (`\r\n`) line endings: Node
-/// `@modelcontextprotocol/sdk` servers emit LF, while Python `fastmcp` / MCP
-/// SDK servers (via `sse-starlette`, whose default separator is CRLF) emit
-/// `\r\n\r\n` event terminators. Returns `None` until the buffer holds a
-/// complete event carrying a parseable JSON-RPC response.
-fn extract_jsonrpc_from_sse_buffer(buffer: &str) -> Option<JsonRpcResponse> {
-    // Normalize CRLF to LF so blank-line event boundaries are detectable.
-    let normalized = buffer.replace('\r', "");
+fn response_size_error() -> McpError {
+    McpError::Transport("MCP HTTP response exceeds the 64 MiB limit".into())
+}
 
-    for event_block in normalized.split("\n\n") {
-        let mut data_lines = Vec::new();
-        for line in event_block.lines() {
-            if let Some(value) = line.strip_prefix("data:") {
-                data_lines.push(value.trim());
+/// Reassemble complete LF or CRLF frames without rescanning a partial line.
+/// Keep the stream as bytes until JSON parsing so split UTF-8 remains intact.
+#[derive(Default)]
+struct SseResponse {
+    buffer: Vec<u8>,
+    data: Vec<u8>,
+}
+
+impl SseResponse {
+    fn push(&mut self, chunk: &[u8], request_id: u64) -> Option<JsonRpcResponse> {
+        let mut scan_from = self.buffer.len();
+        self.buffer.extend_from_slice(chunk);
+        let mut start = 0;
+        while let Some(offset) = self.buffer[scan_from..].iter().position(|byte| *byte == b'\n') {
+            let end = scan_from + offset;
+            let line = &self.buffer[start..end];
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() {
+                if let Ok(response) = serde_json::from_slice::<JsonRpcResponse>(&self.data)
+                    && response.id == Some(request_id)
+                    && (response.result.is_some() || response.error.is_some())
+                {
+                    return Some(response);
+                }
+                self.data.clear();
+            } else if let Some(value) = line.strip_prefix(b"data:") {
+                if !self.data.is_empty() {
+                    self.data.push(b'\n');
+                }
+                self.data.extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
             }
+            start = end + 1;
+            scan_from = start;
         }
-
-        let data = data_lines.join("\n");
-        if !data.is_empty()
-            && let Ok(rpc_response) = serde_json::from_str::<JsonRpcResponse>(&data)
-        {
-            return Some(rpc_response);
-        }
+        self.buffer.drain(..start);
+        None
     }
-
-    None
 }
 
 #[async_trait]
 impl McpTransport for StreamableHttpTransport {
     async fn request(&self, req: &JsonRpcRequest) -> Result<JsonRpcResponse, McpError> {
+        let request_id = req
+            .id
+            .ok_or_else(|| McpError::Transport("Request must have an id".into()))?;
         let body =
             serde_json::to_string(req).map_err(|e| McpError::Transport(format!("JSON serialize error: {}", e)))?;
 
-        let http_req = self.build_request(&body).await;
+        let http_req = self.build_request(body).await;
         let response = http_req
             .send()
             .await
-            .map_err(|e| McpError::Transport(format!("HTTP request failed: {}", e)))?;
+            .map_err(|e| McpError::Transport(format!("HTTP request failed: {}", e.without_url())))?;
 
         if !response.status().is_success() {
             return Err(McpError::Transport(format!(
@@ -158,7 +184,7 @@ impl McpTransport for StreamableHttpTransport {
             )));
         }
 
-        let rpc_response = self.parse_response(response).await?;
+        let rpc_response = self.parse_response(response, request_id).await?;
 
         if let Some(err) = &rpc_response.error {
             return Err(McpError::JsonRpc {
@@ -174,11 +200,11 @@ impl McpTransport for StreamableHttpTransport {
         let body =
             serde_json::to_string(req).map_err(|e| McpError::Transport(format!("JSON serialize error: {}", e)))?;
 
-        let http_req = self.build_request(&body).await;
+        let http_req = self.build_request(body).await;
         http_req
             .send()
             .await
-            .map_err(|e| McpError::Transport(format!("Notification request failed: {}", e)))?;
+            .map_err(|e| McpError::Transport(format!("Notification request failed: {}", e.without_url())))?;
 
         Ok(())
     }
