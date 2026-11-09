@@ -3,7 +3,7 @@ use super::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     // -- truncate_display -----------------------------------------------------
 
@@ -143,8 +143,8 @@ mod tests {
 
     // -- execute_single integration tests (deferred tool hint) ----------------
 
-    use aion_tools::Tool;
     use aion_tools::registry::ToolRegistry;
+    use aion_tools::{Tool, ToolExecutionOutput};
 
     struct MockDeferredTool {
         schema: serde_json::Value,
@@ -234,60 +234,134 @@ mod tests {
         registry
     }
 
-    #[tokio::test]
-    async fn execute_single_passes_the_engine_call_id_to_host_tool() {
-        use aion_protocol::events::ToolCategory;
-        use aion_tools::ToolExecutionOutput;
-        use aion_types::tool::ToolResult;
-        use serde_json::Value;
+    struct HostTool(Arc<Mutex<Vec<String>>>);
 
-        struct HostTool;
-
-        #[async_trait::async_trait]
-        impl Tool for HostTool {
-            fn name(&self) -> &str {
-                "HostTool"
-            }
-            fn description(&self) -> &str {
-                "Test host callback"
-            }
-            fn input_schema(&self) -> Value {
-                json!({"type": "object"})
-            }
-            fn is_concurrency_safe(&self, _input: &Value) -> bool {
-                true
-            }
-            async fn execute(&self, _input: Value) -> ToolResult {
-                panic!("the host callback needs its engine call ID");
-            }
-            async fn execute_with_call_id(&self, _input: Value, call_id: &str) -> ToolExecutionOutput {
-                ToolResult {
-                    content: call_id.into(),
-                    is_error: false,
-                }
-                .into()
-            }
-            fn category(&self) -> ToolCategory {
-                ToolCategory::Mcp
-            }
+    #[async_trait::async_trait]
+    impl Tool for HostTool {
+        fn name(&self) -> &str {
+            "HostTool"
         }
+        fn description(&self) -> &str {
+            "Test host callback"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn is_concurrency_safe(&self, _input: &Value) -> bool {
+            true
+        }
+        fn uses_host_approval(&self, input: &Value) -> bool {
+            input["host_approval"] == true
+        }
+        async fn execute(&self, _input: Value) -> ToolResult {
+            panic!("the host callback needs its engine call ID");
+        }
+        async fn execute_with_call_id(&self, _input: Value, call_id: &str) -> ToolExecutionOutput {
+            self.0.lock().unwrap().push(call_id.into());
+            ToolResult {
+                content: call_id.into(),
+                is_error: false,
+            }
+            .into()
+        }
+        fn category(&self) -> ToolCategory {
+            ToolCategory::Mcp
+        }
+    }
 
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(HostTool));
-        let call = ContentBlock::ToolUse {
-            id: "host-call-42".into(),
+    fn host_tool_call(id: &str, host_approval: bool) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.into(),
             name: "HostTool".into(),
-            input: json!({}),
+            input: json!({"host_approval": host_approval}),
             extra: None,
-        };
-        let (result, _, blocks) =
-            execute_single(&registry, &call, None, aion_compact::CompactLevel::Off, false, 10_000).await;
+        }
+    }
+
+    #[derive(Default)]
+    struct ApprovalRequests(Mutex<Vec<String>>);
+
+    impl ProtocolEmitter for ApprovalRequests {
+        fn emit(&self, event: &ProtocolEvent) -> std::io::Result<()> {
+            if let ProtocolEvent::ToolRequest { call_id, .. } = event {
+                self.0.lock().unwrap().push(call_id.clone());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_delegates_only_calls_requiring_host_approval() {
+        let mut registry = ToolRegistry::new();
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        registry.register(Box::new(HostTool(executed.clone())));
+        let calls = [host_tool_call("delegated", true), host_tool_call("ordinary", false)];
+        let approval_manager = Arc::new(ToolApprovalManager::new());
+        let requests = Arc::new(ApprovalRequests::default());
+        let writer: Arc<dyn ProtocolEmitter> = requests.clone();
+
+        let mut result = std::pin::pin!(execute_tool_calls_with_approval(
+            &registry,
+            &calls,
+            &approval_manager,
+            &writer,
+            "message",
+            false,
+            &[],
+            None,
+            aion_compact::CompactLevel::Off,
+            false,
+        ));
+        assert!(futures::poll!(result.as_mut()).is_pending());
+        assert_eq!(*requests.0.lock().unwrap(), ["ordinary"]);
+        assert_eq!(*executed.lock().unwrap(), ["delegated"]);
+
+        approval_manager.resolve(
+            "ordinary",
+            ToolApprovalResult::Denied {
+                reason: "declined".into(),
+            },
+        );
+        let outcome = result.await.unwrap();
         assert!(matches!(
+            outcome.results.as_slice(),
+            [
+                ContentBlock::ToolResult { tool_use_id, content, is_error: false },
+                ContentBlock::ToolResult { tool_use_id: denied_id, is_error: true, .. },
+            ] if tool_use_id == "delegated" && content == tool_use_id && denied_id == "ordinary"
+        ));
+        assert_eq!(*executed.lock().unwrap(), ["delegated"]);
+    }
+
+    #[tokio::test]
+    async fn terminal_rejects_host_approval_even_with_auto_approve() {
+        let mut registry = ToolRegistry::new();
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        registry.register(Box::new(HostTool(executed.clone())));
+        let calls = [host_tool_call("ordinary", false), host_tool_call("delegated", true)];
+        let confirmer = Arc::new(Mutex::new(ToolConfirmer::new(true, vec![])));
+
+        let outcome = execute_tool_calls(
+            &registry,
+            &calls,
+            &confirmer,
+            None,
+            aion_compact::CompactLevel::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*executed.lock().unwrap(), ["ordinary"]);
+        assert!(outcome.results.iter().any(|result| matches!(
+            result,
+            ContentBlock::ToolResult { tool_use_id, content, is_error: true }
+                if tool_use_id == "delegated" && content.contains("requires approval from an embedding host")
+        )));
+        assert!(outcome.results.iter().any(|result| matches!(
             result,
             ContentBlock::ToolResult { tool_use_id, content, is_error: false }
-                if tool_use_id == "host-call-42" && content == tool_use_id
-        ));
-        assert!(blocks.is_empty());
+                if tool_use_id == "ordinary" && content == tool_use_id
+        )));
     }
 
     #[tokio::test]

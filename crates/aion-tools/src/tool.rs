@@ -71,6 +71,12 @@ pub trait Tool: Send + Sync {
         self.execute_with_follow_up(input).await
     }
 
+    /// Whether the embedding host is responsible for approving this call before acting on it.
+    /// Calls using host approval are rejected when running without protocol-based approval.
+    fn uses_host_approval(&self, _input: &Value) -> bool {
+        false
+    }
+
     /// Whether advertising and executing this tool requires image-input
     /// support from the currently selected model.
     fn requires_image_input(&self) -> bool {

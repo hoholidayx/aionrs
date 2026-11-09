@@ -6,6 +6,7 @@
 //! expose no tools to the model: the runtime SSE parser searched for `\n\n`
 //! event boundaries, which never appear in a `\r\n\r\n`-delimited stream.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use aion_mcp::config::{McpServerConfig, TransportType};
@@ -67,6 +68,15 @@ async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
 
 #[tokio::test]
 async fn stateful_fastmcp_style_server_discovers_pages_and_closes_session() {
+    check_stateful_session(false).await;
+}
+
+#[tokio::test]
+async fn pinned_direct_http_discovers_tools_and_closes_session() {
+    check_stateful_session(true).await;
+}
+
+async fn check_stateful_session(direct: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{addr}/mcp");
@@ -77,6 +87,7 @@ async fn stateful_fastmcp_style_server_discovers_pages_and_closes_session() {
             let (mut socket, _) = listener.accept().await.unwrap();
             let request = read_http_request(&mut socket).await;
             let headers = request.split("\r\n\r\n").next().unwrap().to_ascii_lowercase();
+            assert!(headers.contains("authorization: bearer synthetic-token"));
             if request.starts_with("DELETE ") {
                 assert!(headers.contains("mcp-session-id: session-abc-123"));
                 assert!(headers.contains("mcp-protocol-version: 2025-06-18"));
@@ -131,11 +142,19 @@ async fn stateful_fastmcp_style_server_discovers_pages_and_closes_session() {
         args: None,
         env: None,
         url: Some(url),
-        headers: None,
+        headers: Some(HashMap::from([(
+            "Authorization".into(),
+            "Bearer synthetic-token".into(),
+        )])),
         deferred: None,
         startup_timeout_ms: Some(5_000),
     };
-    let manager = McpManager::connect_pinned_http("images", &config).await.unwrap();
+    let manager = if direct {
+        McpManager::connect_pinned_http_direct("images", &config).await
+    } else {
+        McpManager::connect_pinned_http("images", &config).await
+    }
+    .unwrap();
     assert!(manager.has_tool_name("image_submit"));
     assert!(manager.has_tool_name("image_status"));
     assert!(manager.has_tool_name("image_result"));

@@ -33,6 +33,12 @@ struct McpServer {
     supports_resources: bool,
 }
 
+enum ConnectionPolicy {
+    Configured,
+    PinnedHttp,
+    PinnedHttpDirect,
+}
+
 /// Manages connections to multiple MCP servers
 pub struct McpManager {
     servers: HashMap<String, McpServer>,
@@ -52,15 +58,28 @@ impl McpManager {
         pinned: &HashSet<String>,
     ) -> Result<Self, McpError> {
         Self::connect_all_with_connector(configs, |name, config| {
-            let pinned = pinned.contains(&name);
-            async move { Self::connect_server(&name, &config, pinned).await }
+            let policy = if pinned.contains(&name) {
+                ConnectionPolicy::PinnedHttp
+            } else {
+                ConnectionPolicy::Configured
+            };
+            async move { Self::connect_server(&name, &config, policy).await }
         })
         .await
     }
 
     /// Connect to a single configured Streamable HTTP endpoint without following redirects.
     pub async fn connect_pinned_http(name: &str, config: &McpServerConfig) -> Result<Self, McpError> {
-        let server = Self::with_startup_timeout(name, config, Self::connect_server(name, config, true)).await?;
+        Self::connect_single(name, config, ConnectionPolicy::PinnedHttp).await
+    }
+
+    /// Connect to a single Streamable HTTP endpoint without redirects or proxy use.
+    pub async fn connect_pinned_http_direct(name: &str, config: &McpServerConfig) -> Result<Self, McpError> {
+        Self::connect_single(name, config, ConnectionPolicy::PinnedHttpDirect).await
+    }
+
+    async fn connect_single(name: &str, config: &McpServerConfig, policy: ConnectionPolicy) -> Result<Self, McpError> {
+        let server = Self::with_startup_timeout(name, config, Self::connect_server(name, config, policy)).await?;
         Ok(Self {
             servers: HashMap::from([(name.to_owned(), server)]),
             next_id: AtomicU64::new(FIRST_CALL_ID),
@@ -132,7 +151,12 @@ impl McpManager {
     /// Connect a single additional MCP server after initial setup.
     /// Returns the list of tool names exposed by the server.
     pub async fn connect_one(&mut self, name: String, config: &McpServerConfig) -> Result<Vec<String>, McpError> {
-        let server = Self::with_startup_timeout(&name, config, Self::connect_server(&name, config, false)).await?;
+        let server = Self::with_startup_timeout(
+            &name,
+            config,
+            Self::connect_server(&name, config, ConnectionPolicy::Configured),
+        )
+        .await?;
         let tool_names: Vec<String> = server.tools.iter().map(|t| t.name.clone()).collect();
         tracing::info!(target: "aion_mcp", server = %name, tools = server.tools.len(), resources = server.supports_resources, "mcp server connected");
         self.servers.insert(name, server);
@@ -140,7 +164,12 @@ impl McpManager {
     }
 
     /// Connect to a single MCP server: create transport, initialize, discover tools
-    async fn connect_server(name: &str, config: &McpServerConfig, pinned: bool) -> Result<McpServer, McpError> {
+    async fn connect_server(
+        name: &str,
+        config: &McpServerConfig,
+        policy: ConnectionPolicy,
+    ) -> Result<McpServer, McpError> {
+        let pinned = !matches!(policy, ConnectionPolicy::Configured);
         if pinned && !matches!(config.transport, TransportType::StreamableHttp) {
             return Err(McpError::InitFailed("Pinned endpoint requires Streamable HTTP".into()));
         }
@@ -171,11 +200,12 @@ impl McpManager {
                     .as_deref()
                     .ok_or_else(|| McpError::InitFailed("streamable-http transport requires 'url'".into()))?;
                 let headers = config.headers.as_ref().unwrap_or(&empty_map);
-                if pinned {
-                    Box::new(StreamableHttpTransport::connect_pinned(url, headers)?)
-                } else {
-                    Box::new(StreamableHttpTransport::connect(url, headers).await?)
-                }
+                let transport = match policy {
+                    ConnectionPolicy::Configured => StreamableHttpTransport::connect(url, headers).await?,
+                    ConnectionPolicy::PinnedHttp => StreamableHttpTransport::connect_pinned(url, headers)?,
+                    ConnectionPolicy::PinnedHttpDirect => StreamableHttpTransport::connect_pinned_direct(url, headers)?,
+                };
+                Box::new(transport)
             }
         };
 

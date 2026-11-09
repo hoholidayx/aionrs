@@ -43,11 +43,23 @@ impl StreamableHttpTransport {
     }
 
     pub(crate) fn connect_pinned(url: &str, headers: &HashMap<String, String>) -> Result<Self, McpError> {
+        Self::connect_pinned_with_builder(url, headers, reqwest::Client::builder())
+    }
+
+    pub(crate) fn connect_pinned_direct(url: &str, headers: &HashMap<String, String>) -> Result<Self, McpError> {
+        Self::connect_pinned_with_builder(url, headers, reqwest::Client::builder().no_proxy())
+    }
+
+    fn connect_pinned_with_builder(
+        url: &str,
+        headers: &HashMap<String, String>,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Self, McpError> {
         let endpoint = Url::parse(url).map_err(|_| McpError::InitFailed("Invalid MCP HTTP endpoint".into()))?;
         if !matches!(endpoint.scheme(), "http" | "https") {
             return Err(McpError::InitFailed("Invalid MCP HTTP endpoint scheme".into()));
         }
-        let client = reqwest::Client::builder()
+        let client = builder
             .redirect(Policy::none())
             .build()
             .map_err(|_| McpError::InitFailed("Failed to create pinned MCP HTTP client".into()))?;
