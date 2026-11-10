@@ -171,6 +171,13 @@ appropriate existing crate in the dependency graph — don't copy-paste
 or reimplement. Choose the extraction target based on where it
 semantically belongs and where it minimizes dependency changes.
 
+Before adding an integration path, trace the existing engine entry point and
+its callers. Reuse shared protocol types, configuration constants, and session
+lifecycle methods. Keep host-specific account, UI, and storage policies in the
+host. When extending cancellation, restart, or cleanup behavior, scope the
+change to the affected session and verify the ordering and error behavior that
+existing callers rely on.
+
 ## Cross-Platform
 
 CI runs on macOS, Linux, **and Windows**. Local dev can only test the
