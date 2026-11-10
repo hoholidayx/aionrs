@@ -45,7 +45,7 @@ cargo fmt --all        # Format (CI enforces this)
 
 **Pushing code: always use `just push` instead of `git push`.**
 It runs fmt → clippy → test before pushing, preventing CI failures.
-Supports the same arguments as `git push` (e.g. `just push -u origin branch`).
+In the owner's Aion workspace, commit on local `main` by default. When the user requests a push, verify that `origin` is the owner's repository and run `just push origin main`. Use a feature branch or pull request only when requested.
 
 ## Code Standards
 
