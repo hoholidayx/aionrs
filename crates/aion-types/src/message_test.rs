@@ -339,6 +339,7 @@ mod tests {
         assert_eq!(extension_to_image_media_type("png"), Some("image/png"));
         assert_eq!(extension_to_image_media_type("gif"), Some("image/gif"));
         assert_eq!(extension_to_image_media_type("webp"), Some("image/webp"));
+        assert_eq!(extension_to_image_media_type(".JpEg"), Some("image/jpeg"));
     }
 
     #[test]
@@ -347,6 +348,22 @@ mod tests {
         assert_eq!(extension_to_image_media_type("bmp"), None);
         assert_eq!(extension_to_image_media_type("tiff"), None);
         assert_eq!(extension_to_image_media_type("txt"), None);
+    }
+
+    #[test]
+    fn detect_image_media_type_recognizes_supported_signatures() {
+        assert_eq!(detect_image_media_type(b"\xff\xd8\xff"), Some("image/jpeg"));
+        assert_eq!(detect_image_media_type(b"\x89PNG\r\n\x1a\n"), Some("image/png"));
+        assert_eq!(detect_image_media_type(b"GIF87a"), Some("image/gif"));
+        assert_eq!(detect_image_media_type(b"GIF89a"), Some("image/gif"));
+        assert_eq!(detect_image_media_type(b"RIFF\0\0\0\0WEBP"), Some("image/webp"));
+    }
+
+    #[test]
+    fn detect_image_media_type_rejects_truncated_webp_and_other_riff_formats() {
+        assert_eq!(detect_image_media_type(b"RIFF\0\0\0\0WEB"), None);
+        assert_eq!(detect_image_media_type(b"RIFF\0\0\0\0WAVE"), None);
+        assert_eq!(detect_image_media_type(b""), None);
     }
 
     #[test]

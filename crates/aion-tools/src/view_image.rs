@@ -6,26 +6,12 @@ use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
 
 use aion_protocol::events::ToolCategory;
-use aion_types::message::{ContentBlock, ImageUrl, extension_to_image_media_type};
+use aion_types::message::{ContentBlock, ImageUrl, detect_image_media_type, extension_to_image_media_type};
 use aion_types::tool::{JsonSchema, ToolResult};
 
 use crate::{Tool, ToolExecutionOutput};
 
 const MAX_IMAGE_SIZE_BYTES: u64 = 20 * 1024 * 1024;
-
-fn detect_image_media_type(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(b"\xff\xd8\xff") {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
-}
 
 pub struct ViewImageTool;
 

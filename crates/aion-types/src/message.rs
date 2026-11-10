@@ -63,8 +63,13 @@ pub struct ImageUrl {
     pub url: String,
 }
 
+const IMAGE_JPEG: &str = "image/jpeg";
+const IMAGE_PNG: &str = "image/png";
+const IMAGE_GIF: &str = "image/gif";
+const IMAGE_WEBP: &str = "image/webp";
+
 /// Media types that are widely accepted as vision input by major providers.
-pub const SUPPORTED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
+pub const SUPPORTED_IMAGE_MEDIA_TYPES: &[&str] = &[IMAGE_JPEG, IMAGE_PNG, IMAGE_GIF, IMAGE_WEBP];
 
 /// Map a file extension to a supported image media type.
 ///
@@ -73,11 +78,29 @@ pub const SUPPORTED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "i
 pub fn extension_to_image_media_type(ext: &str) -> Option<&'static str> {
     let ext = ext.trim_start_matches('.').to_lowercase();
     match ext.as_str() {
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "png" => Some("image/png"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
+        "jpg" | "jpeg" => Some(IMAGE_JPEG),
+        "png" => Some(IMAGE_PNG),
+        "gif" => Some(IMAGE_GIF),
+        "webp" => Some(IMAGE_WEBP),
         _ => None,
+    }
+}
+
+/// Identify a supported image media type from its file signature.
+///
+/// This checks the header only. Callers must compare the result with any
+/// expected media type and perform any required format validation separately.
+pub fn detect_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(IMAGE_PNG)
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some(IMAGE_JPEG)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(IMAGE_GIF)
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some(IMAGE_WEBP)
+    } else {
+        None
     }
 }
 
